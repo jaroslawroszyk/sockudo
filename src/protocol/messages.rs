@@ -1,0 +1,193 @@
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageData {
+    String(String),
+    Structured {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel_data: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        channel: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_data: Option<String>,
+        #[serde(flatten)]
+        extra: HashMap<String, Value>,
+    },
+    Json(Value),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PusherMessage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<MessageData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PusherApiMessage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<ApiMessageData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub socket_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ApiMessageData {
+    String(String),
+    Json(Value),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SentPusherMessage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<MessageData>,
+}
+
+#[derive(Debug, Clone)]
+pub enum WebSocketMessage {
+    Binary(Vec<u8>),
+    Json(PusherMessage),
+}
+
+impl TryFrom<Vec<u8>> for WebSocketMessage {
+    type Error = serde_json::Error;
+
+    fn try_from(buffer: Vec<u8>) -> Result<Self, Self::Error> {
+        match serde_json::from_slice::<PusherMessage>(&buffer) {
+            Ok(message) => Ok(WebSocketMessage::Json(message)),
+            Err(_) => Ok(WebSocketMessage::Binary(buffer)),
+        }
+    }
+}
+
+// Helper implementations
+impl MessageData {
+    pub fn as_string(&self) -> Option<&str> {
+        match self {
+            MessageData::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn into_string(self) -> Option<String> {
+        match self {
+            MessageData::String(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_value(&self) -> Option<&Value> {
+        match self {
+            MessageData::Structured { ref extra, .. } => extra.values().next(),
+            _ => None,
+        }
+    }
+}
+
+impl From<String> for MessageData {
+    fn from(s: String) -> Self {
+        MessageData::String(s)
+    }
+}
+
+impl From<Value> for MessageData {
+    fn from(v: Value) -> Self {
+        MessageData::Structured {
+            channel_data: None,
+            channel: None,
+            user_data: None,
+            extra: {
+                let mut map = HashMap::new();
+                map.insert("data".to_string(), v);
+                map
+            },
+        }
+    }
+}
+
+
+impl PusherMessage {
+    pub fn connection_established(socket_id: String) -> Self {
+        Self {
+            event: Some("pusher:connection_established".to_string()),
+            data: Some(MessageData::from(json!({
+                "socket_id": socket_id,
+                "activity_timeout": 120
+            }).to_string())),
+            channel: None,
+            name: None,
+        }
+    }
+
+    pub fn subscription_succeeded(channel: String, presence_data: Option<Value>) -> Self {
+        Self {
+            event: Some("pusher_internal:subscription_succeeded".to_string()),
+            channel: Some(channel),
+            data: presence_data.map(MessageData::from),
+            name: None,
+        }
+    }
+
+    pub fn error(code: u16, message: String) -> Self {
+        Self {
+            event: Some("pusher:error".to_string()),
+            data: Some(MessageData::from(json!({
+                "code": code,
+                "message": message
+            }))),
+            channel: None,
+            name: None,
+        }
+    }
+
+    pub fn channel_event<S: Into<String>>(event: S, channel: S, data: Value) -> Self {
+        Self {
+            event: Some(event.into()),
+            channel: Some(channel.into()),
+            data: Some(MessageData::from(data)),
+            name: None,
+        }
+    }
+
+    pub fn member_added(channel: String, user_id: String, user_info: Option<Value>) -> Self {
+        Self {
+            event: Some("pusher_internal:member_added".to_string()),
+            channel: Some(channel),
+            data: Some(MessageData::from(json!({
+                "user_id": user_id,
+                "user_info": user_info
+            }))),
+            name: None,
+        }
+    }
+
+    pub fn member_removed(channel: String, user_id: String) -> Self {
+        Self {
+            event: Some("pusher_internal:member_removed".to_string()),
+            channel: Some(channel),
+            data: Some(MessageData::from(json!({
+                "user_id": user_id
+            }))),
+            name: None,
+        }
+    }
+}
