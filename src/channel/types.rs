@@ -11,7 +11,7 @@ pub enum ChannelType {
 }
 
 impl ChannelType {
-    pub fn from_name(channel_name: &String) -> Self {
+    pub fn from_name(channel_name: &str) -> Self {
         Log::info(format!("From name: {:?}", channel_name));
         match channel_name.split_once('-') {
             Some(("private", "encrypted")) => Self::PrivateEncrypted,

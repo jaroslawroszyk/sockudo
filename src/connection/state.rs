@@ -1,7 +1,8 @@
+use crate::channel::PresenceMemberInfo;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use crate::channel::PresenceMemberInfo;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct SocketId(pub String);
@@ -32,16 +33,16 @@ impl std::fmt::Display for SocketId {
     }
 }
 
-
 #[derive(Debug)]
 pub struct ConnectionState {
     pub socket_id: SocketId,
     pub app_key: String,
-    pub app_id : String,
+    pub app_id: String,
     pub subscribed_channels: HashSet<String>,
     pub user_id: Option<String>,
     pub last_ping: std::time::Instant,
     pub presence: Option<HashMap<String, PresenceMemberInfo>>,
+    pub user: Option<Value>,
 }
 
 impl ConnectionState {
@@ -54,6 +55,7 @@ impl ConnectionState {
             user_id: None,
             last_ping: std::time::Instant::now(),
             presence: None,
+            user: None,
         }
     }
 
@@ -62,7 +64,7 @@ impl ConnectionState {
     }
 
     pub fn is_subscribed(&self, channel: &str) -> bool {
-        self.subscribed_channels.contains(channel) 
+        self.subscribed_channels.contains(channel)
     }
 
     pub fn add_subscription(&mut self, channel: String) {
