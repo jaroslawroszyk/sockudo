@@ -4,7 +4,7 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Performs a timing-safe comparison of two strings
-fn secure_compare(a: &str, b: &str) -> bool {
+pub fn secure_compare(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }

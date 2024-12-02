@@ -145,17 +145,27 @@ impl Log {
         let margin_spaces = " ".repeat(margin);
         let padding_spaces = " ".repeat(padding);
 
-        // Handle potential JSON values
-        if colored_message.starts_with('{') || colored_message.starts_with('[') {
+        // Handle JSON values - both string representations and Value types
+        let formatted_message =
             if let Ok(json_value) = serde_json::from_str::<Value>(&colored_message) {
-                colored_message =
-                    serde_json::to_string_pretty(&json_value).unwrap_or_else(|_| colored_message);
-            }
-        }
+                serde_json::to_string_pretty(&json_value).unwrap_or(colored_message)
+            } else if let Some(stripped) = colored_message.strip_prefix("Value(") {
+                if let Some(stripped) = stripped.strip_suffix(")") {
+                    if let Ok(json_value) = serde_json::from_str::<Value>(stripped) {
+                        serde_json::to_string_pretty(&json_value).unwrap_or(colored_message)
+                    } else {
+                        colored_message
+                    }
+                } else {
+                    colored_message
+                }
+            } else {
+                colored_message
+            };
 
         println!(
             "{}{}{}{}",
-            margin_spaces, padding_spaces, colored_message, padding_spaces
+            margin_spaces, padding_spaces, formatted_message, padding_spaces
         );
     }
 }

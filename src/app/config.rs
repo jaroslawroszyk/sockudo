@@ -1,6 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub app_id: String,
@@ -34,7 +32,7 @@ impl Default for AppConfig {
             key: String::new(),
             secret: String::new(),
             max_connections: 10000,
-            enable_client_events: false,
+            enable_client_events: true,
             encrypted: false,
             webhook_urls: Vec::new(),
             max_channel_name_length: 200,

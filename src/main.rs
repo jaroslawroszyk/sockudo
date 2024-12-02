@@ -11,30 +11,30 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::routing::post;
 use axum::{
-    extract::{Path, Query, State, WebSocketUpgrade},
+    extract::{Path, Query, State},
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use fastwebsockets::upgrade;
-use log::Log;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::net::SocketAddr;
 use std::sync::Arc;
+use sysinfo::System;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use crate::app::auth::{AuthValidator, ChannelAuth};
+use crate::app::auth::AuthValidator;
 use crate::app::config::AppConfig;
 use crate::app::manager::AppManager;
 use crate::connection::state::SocketId;
-use crate::protocol::messages::{PusherApiMessage, PusherMessage};
+use crate::log::Log;
+use crate::protocol::messages::PusherApiMessage;
 use crate::{
     channel::ChannelManager,
     connection::{ConnectionHandler, ConnectionManager},
-    error::{Error, Result},
+    error::Result,
 };
 
 // Server state containing all managers
@@ -58,8 +58,10 @@ async fn main() -> Result<()> {
 
     // Create managers
     let app_manager = Arc::new(AppManager::new());
-    let channel_manager = Arc::new(RwLock::new(ChannelManager::new()));
     let connection_manager = Arc::new(Mutex::new(ConnectionManager::new()));
+    let channel_manager = Arc::new(RwLock::new(ChannelManager::new(Arc::clone(
+        &connection_manager,
+    ))));
     let auth_validator = Arc::new(AuthValidator::new(app_manager.clone()));
 
     // Register demo app (you would typically load this from config)
@@ -100,6 +102,11 @@ async fn main() -> Result<()> {
         .route("/apps/:appId/events", post(events))
         .route("/apps/:appId/batch_events", post(batch_events))
         .route("/apps/:app_id/channels/:channel_name", get(channel))
+        .route(
+            "/apps/:app_id/users/:user_id/terminate_connections",
+            post(terminate_user_connections),
+        )
+        .route("/usage", get(usage))
         .layer(cors)
         .with_state(handler.clone());
 
@@ -108,12 +115,6 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| "127.0.0.1:6001".to_string())
         .parse()
         .expect("Invalid bind address");
-    let mesage = json!({
-        "message": "Server started",
-        "address": addr
-    });
-    Log::info(mesage);
-    // Start the server
     tracing::info!("Starting server on {}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
@@ -128,9 +129,6 @@ async fn handle_ws_upgrade(
     ws: upgrade::IncomingUpgrade,
     State(handler): State<Arc<ConnectionHandler>>,
 ) -> impl IntoResponse {
-    tracing::debug!("WebSocket upgrade request for app_key: {}", app_key);
-    Log::info("Test");
-    // Handle upgrade
     let (response, fut) = ws.upgrade().unwrap();
     tokio::task::spawn(async move {
         if let Err(e) = handler.handle_socket(fut, app_key).await {
@@ -139,7 +137,56 @@ async fn handle_ws_upgrade(
     });
     response
 }
-#[derive(Deserialize, Serialize)]
+
+#[derive(Serialize)]
+struct MemoryStats {
+    free: u64,
+    used: u64,
+    total: u64,
+    percent: f64,
+}
+
+#[derive(Serialize)]
+struct UsageResponse {
+    memory: MemoryStats,
+}
+
+pub async fn usage() -> impl IntoResponse {
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    // Get memory statistics
+    let total = sys.total_memory() * 1024; // Convert to bytes
+    let used = sys.used_memory() * 1024;
+    let free = total - used;
+    let percent = (used as f64 / total as f64) * 100.0;
+
+    let memory_stats = MemoryStats {
+        free,
+        used,
+        total,
+        percent,
+    };
+
+    // Create response
+    let response = UsageResponse {
+        memory: memory_stats,
+    };
+
+    // Log memory usage
+    tracing::info!(
+        "Memory usage - Total: {} bytes, Used: {} bytes, Free: {} bytes, Usage: {:.2}%",
+        total,
+        used,
+        free,
+        percent
+    );
+
+    // Return JSON response
+    Json(response)
+}
+
+#[derive(Deserialize, Serialize, Debug)]
 struct EventQuery {
     auth_key: String,
     auth_timestamp: String,
@@ -154,35 +201,58 @@ async fn events(
     State(handler): State<Arc<ConnectionHandler>>,
     Json(event): Json<PusherApiMessage>,
 ) -> impl IntoResponse {
-    let channel_manager = match handler.app_manager.get_channel_manager(&app_id) {
-        Some(cm) => cm,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "error": "App not found"
-                })),
-            )
-                .into_response();
-        }
-    };
-    let event_name = event.clone().name.clone().unwrap();
-    let event_data = event.clone().data.clone().unwrap();
-    for channel in event.channels.unwrap() {
-        channel_manager
-            .write()
-            .await
-            .broadcast_to_channel(
-                &app_id,
-                &handler.connection_manager,
-                &channel,
-                event_name.clone(),
-                serde_json::to_value(event_data.clone()).unwrap(),
-                None,
-            )
-            .await
-            .expect("REASON")
+    let PusherApiMessage {
+        name: _,
+        data: _,
+        channels,
+        channel,
+        socket_id,
+    } = event.clone();
+    let app = handler.app_manager.get_app(app_id.as_str());
+    if app.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "error": "App not found"
+            })),
+        )
+            .into_response();
     }
+    let socket_id = socket_id.map(SocketId);
+    match channels {
+        Some(channels) => {
+            for channel in channels {
+                handler
+                    .send_message(&app_id, socket_id.as_ref(), event.clone(), channel.as_str())
+                    .await;
+            }
+        }
+        None => {
+            handler
+                .send_message(
+                    &app_id,
+                    socket_id.as_ref(),
+                    event.clone(),
+                    channel.expect("REASON").as_str(),
+                )
+                .await;
+        }
+    }
+    (StatusCode::OK, Json(json!({"ok": "true"}))).into_response()
+}
+
+pub async fn terminate_user_connections(
+    Path(app_id): Path<String>,
+    Path(user_id): Path<String>,
+    State(handler): State<Arc<ConnectionHandler>>,
+) -> impl IntoResponse {
+    let connection_manager = handler.connection_manager.clone();
+    connection_manager
+        .lock()
+        .await
+        .terminate_connection(&app_id, &user_id)
+        .await
+        .expect("REASON");
     (
         StatusCode::OK,
         Json(json!({
@@ -192,61 +262,25 @@ async fn events(
         .into_response()
 }
 
-pub async fn terminate_user_connections(
-    app_id: &str,
-    user_id: &str,
-    connection_manager: &mut Arc<Mutex<ConnectionManager>>,
-    channel_manager: &Arc<RwLock<ChannelManager>>,
-) {
-    let socket_ids = connection_manager
-        .lock()
-        .await
-        .get_user_connections(user_id, app_id);
-    // Iterate over the socket IDs and terminate the connections
-    for socket_id in socket_ids {
-        connection_manager
-            .lock()
-            .await
-            .terminate_connection(app_id, channel_manager, &socket_id)
-            .await
-            .expect("TODO: panic message");
-    }
-}
-
 pub async fn batch_events(
     Path(app_id): Path<String>,
     State(handler): State<Arc<ConnectionHandler>>,
     Json(batch): Json<Vec<PusherApiMessage>>,
 ) -> impl IntoResponse {
-    let channel_manager = match handler.app_manager.get_channel_manager(&app_id) {
-        Some(cm) => cm,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "error": "App not found"
-                })),
-            )
-                .into_response();
-        }
-    };
     for message in batch.iter() {
-        let event_name = message.clone().name.clone().unwrap();
-        let event_data = message.clone().data.clone().unwrap();
         for channel in message.channels.clone().unwrap() {
-            channel_manager
-                .write()
-                .await
-                .broadcast_to_channel(
+            let socket_id = match message.clone().socket_id {
+                Some(socket_id) => Some(SocketId(socket_id)),
+                None => None,
+            };
+            handler
+                .send_message(
                     &app_id,
-                    &handler.connection_manager,
-                    &channel,
-                    event_name.clone(),
-                    serde_json::to_value(event_data.clone()).unwrap(),
-                    None,
+                    socket_id.as_ref(),
+                    message.clone(),
+                    channel.as_str(),
                 )
-                .await
-                .expect("REASON")
+                .await;
         }
     }
     (
@@ -267,38 +301,6 @@ pub async fn channel(
         .await;
     (StatusCode::OK, Json(response)).into_response()
 }
-
-// Authentication handler for private and presence channels
-// async fn handle_auth(
-//     State(state): State<ServerState>,
-//     Json(auth_request): Json<AuthRequest>,
-// ) -> Result<impl IntoResponse> {
-//     let is_valid = state
-//         .auth_validator
-//         .validate_channel_auth(
-//             SocketId(auth_request.socket_id.clone()),
-//             &auth_request.app_key,
-//             auth_request.user_data.clone().unwrap_or_default(),
-//             auth_request.auth.clone(),
-//         )
-//         .await?;
-
-//     if is_valid {
-//         state
-//             .connection_manager
-//             .lock()
-//             .await
-//             .add_connection(&auth_request.app_key);
-//     }
-
-//     Ok((
-//         StatusCode::OK,
-//         Json(AuthResponse {
-//             auth: "OK".to_string(),
-//         }),
-//     )
-//         .into_response())
-// }
 
 // Query parameters for WebSocket connection
 #[derive(Debug, Deserialize)]

@@ -4,8 +4,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SocketId(pub String);
+
+// Optional but recommended - implement Display for better debugging
+impl std::fmt::Display for SocketId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+// Optional - implement AsRef for convenient string operations
+impl AsRef<str> for SocketId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
 
 impl SocketId {
     pub fn new() -> Self {
@@ -26,21 +40,14 @@ impl SocketId {
         format!("{}.{}", random_number(min, max), random_number(min, max))
     }
 }
-
-impl std::fmt::Display for SocketId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ConnectionState {
     pub socket_id: SocketId,
     pub app_key: String,
     pub app_id: String,
     pub subscribed_channels: HashSet<String>,
     pub user_id: Option<String>,
-    pub last_ping: std::time::Instant,
+    pub last_ping: String,
     pub presence: Option<HashMap<String, PresenceMemberInfo>>,
     pub user: Option<Value>,
 }
@@ -53,7 +60,7 @@ impl ConnectionState {
             app_id: String::new(),
             subscribed_channels: HashSet::new(),
             user_id: None,
-            last_ping: std::time::Instant::now(),
+            last_ping: String::new(),
             presence: None,
             user: None,
         }
@@ -76,6 +83,6 @@ impl ConnectionState {
     }
 
     pub fn update_ping(&mut self) {
-        self.last_ping = std::time::Instant::now();
+        self.last_ping = chrono::Utc::now().to_rfc3339();
     }
 }

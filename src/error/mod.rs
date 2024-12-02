@@ -1,3 +1,4 @@
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -107,7 +108,7 @@ pub enum Error {
     JsonError(#[from] serde_json::Error),
 
     #[error("Client event error: {0}")]
-    ClientEventError(String),  // Add this variant
+    ClientEventError(String), // Add this variant
 
     // I/O errors
     #[error("I/O error: {0}")]
@@ -188,14 +189,14 @@ impl Error {
 }
 
 // Convert to Pusher protocol error message
-// impl From<Error> for crate::protocol::messages::ErrorData {
-//     fn from(error: Error) -> Self {
-//         Self {
-//             code: Some(error.close_code()),
-//             message: error.to_string(),
-//         }
-//     }
-// }
+impl From<Error> for crate::protocol::messages::ErrorData {
+    fn from(error: Error) -> Self {
+        Self {
+            code: Some(error.close_code()),
+            message: error.to_string(),
+        }
+    }
+}
 
 // Helper functions for error handling
 pub type Result<T> = std::result::Result<T, Error>;

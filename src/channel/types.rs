@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::log::Log;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChannelType {
@@ -12,7 +11,6 @@ pub enum ChannelType {
 
 impl ChannelType {
     pub fn from_name(channel_name: &str) -> Self {
-        Log::info(format!("From name: {:?}", channel_name));
         match channel_name.split_once('-') {
             Some(("private", "encrypted")) => Self::PrivateEncrypted,
             Some(("private", _)) => Self::Private,
@@ -33,17 +31,4 @@ impl ChannelType {
 pub struct PresenceMemberInfo {
     pub user_id: String,
     pub user_info: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone)]
-pub struct Channel {
-    pub name: String,
-    pub channel_type: ChannelType,
-    pub subscribers: HashMap<String, SubscriptionInfo>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SubscriptionInfo {
-    pub socket_id: String,
-    pub presence_info: Option<PresenceMemberInfo>,
 }

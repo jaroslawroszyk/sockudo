@@ -20,6 +20,12 @@ pub enum MessageData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorData {
+    pub code: Option<u16>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PusherMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
@@ -60,23 +66,6 @@ pub struct SentPusherMessage {
     pub event: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<MessageData>,
-}
-
-#[derive(Debug, Clone)]
-pub enum WebSocketMessage {
-    Binary(Vec<u8>),
-    Json(PusherMessage),
-}
-
-impl TryFrom<Vec<u8>> for WebSocketMessage {
-    type Error = serde_json::Error;
-
-    fn try_from(buffer: Vec<u8>) -> Result<Self, Self::Error> {
-        match serde_json::from_slice::<PusherMessage>(&buffer) {
-            Ok(message) => Ok(WebSocketMessage::Json(message)),
-            Err(_) => Ok(WebSocketMessage::Binary(buffer)),
-        }
-    }
 }
 
 // Helper implementations
@@ -124,15 +113,17 @@ impl From<Value> for MessageData {
     }
 }
 
-
 impl PusherMessage {
     pub fn connection_established(socket_id: String) -> Self {
         Self {
             event: Some("pusher:connection_established".to_string()),
-            data: Some(MessageData::from(json!({
-                "socket_id": socket_id,
-                "activity_timeout": 120
-            }).to_string())),
+            data: Some(MessageData::from(
+                json!({
+                    "socket_id": socket_id,
+                    "activity_timeout": 120
+                })
+                .to_string(),
+            )),
             channel: None,
             name: None,
         }

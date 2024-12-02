@@ -1,19 +1,18 @@
-use super::types::{Channel, ChannelType, PresenceMemberInfo, SubscriptionInfo};
+use super::types::ChannelType;
+use super::PresenceMemberInfo;
 use crate::app::config::AppConfig;
 use crate::connection::state::SocketId;
 use crate::connection::ConnectionManager;
 use crate::error::Error;
 use crate::log::Log;
-use crate::protocol::messages::{ApiMessageData, MessageData, PusherApiMessage, PusherMessage};
-use crate::token;
-use crate::token::Token;
+use crate::protocol::messages::{MessageData, PusherMessage};
+use crate::token::{secure_compare, Token};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing_subscriber::fmt::format;
 
 #[derive(Debug)]
 struct PresenceData {
@@ -39,271 +38,247 @@ pub struct JoinResponse {
     pub _type: Option<String>,
 }
 
-pub struct ChannelManager {
-    channels: DashMap<String, Channel>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaveResponse {
+    pub(crate) left: bool,
+    remaining_connections: Option<usize>,
+    member: Option<PresenceMember>,
 }
 
-impl Default for ChannelManager {
-    fn default() -> Self {
-        Self::new()
-    }
+pub struct ChannelManager {
+    connection_manager: Arc<Mutex<ConnectionManager>>,
 }
 
 impl ChannelManager {
-    pub fn new() -> Self {
-        Self {
-            channels: DashMap::new(),
-        }
+    pub fn new(connection_manager: Arc<Mutex<ConnectionManager>>) -> Self {
+        Self { connection_manager }
     }
 
     pub async fn subscribe(
         &self,
         socket_id: &str,
         data: &PusherMessage,
+        channel_name: &str,
         is_authenticated: bool,
+        app_id: &str,
     ) -> Result<JoinResponse, Error> {
-        let channel_name = match data.clone().data.unwrap() {
-            MessageData::String(data) => data,
-            MessageData::Structured { channel, .. } => channel.unwrap(),
-            MessageData::Json(data) => {
-                // get channel from data
-                data.get("channel").unwrap().as_str().unwrap().to_string()
-            }
-        };
+        let channel_type = ChannelType::from_name(channel_name);
 
-        let channel_type = ChannelType::from_name(&channel_name);
-
-        // Check if channel requires authentication
         if channel_type.requires_authentication() && !is_authenticated {
-            return Err(Error::AuthError(
-                "Channel requires authentication".to_string(),
-            ));
+            return Err(Error::AuthError("Channel requires authentication".into()));
         }
 
-        // get curren tsokcet base don socket_id
+        let socket_id = SocketId(socket_id.to_string());
 
-        // Get or create channel
-        let subscription = SubscriptionInfo {
-            socket_id: socket_id.to_string(),
-            presence_info: None,
+        Log::info(format!(
+            "Subscribe request - Socket: {}, Channel: {}, Type: {:?}",
+            socket_id, channel_name, channel_type
+        ));
+
+        // Scope the connection_manager lock
+        let mut channel = {
+            let mut connection_manager = self.connection_manager.lock().await;
+            connection_manager.get_channel(app_id, channel_name).unwrap()
         };
 
-        let mut channel = self
-            .channels
-            .entry(channel_name.clone())
-            .or_insert_with(|| Channel {
-                name: channel_name.clone(),
-                channel_type: channel_type.clone(),
-                subscribers: HashMap::new(),
-            });
-
-        if channel_type == ChannelType::Presence {
-            let member: PresenceMember = self.parse_presence_data(&data.clone().data)?;
+        // Check for existing subscription
+        if channel.sockets.contains(&socket_id) {
+            Log::warning(format!(
+                "Socket {} already subscribed to channel {}",
+                socket_id.0, channel_name
+            ));
             return Ok(JoinResponse {
                 success: true,
-                channel_connections: Some(channel.subscribers.len() as i32),
+                channel_connections: Some(channel.sockets.len() as i32),
+                member: None,
                 auth_error: None,
-                member: Option::from(member),
                 error_message: None,
                 error_code: None,
                 _type: None,
             });
         }
 
-        // Add subscriber to channel
-        channel
-            .subscribers
-            .insert(socket_id.to_string(), subscription);
+        // Handle presence channel subscription
+        let member = if channel_type == ChannelType::Presence {
+            let member = self.parse_presence_data(&data.data)?;
+            let presence_info = PresenceMemberInfo {
+                user_id: member.user_id.clone(),
+                user_info: Some(member.user_info.clone()),
+            };
 
-        // Prepare subscription success response
+            if let Some(ref members) = channel.presence_members {
+                members.insert(member.user_id.clone(), presence_info);
+            } else {
+                let members = DashMap::new();
+                members.insert(member.user_id.clone(), presence_info);
+                channel.presence_members = Some(members);
+            }
+
+            Some(member)
+        } else {
+            None
+        };
+
+        // Atomic operation to add socket
+        channel.sockets.insert(socket_id.clone());
+        let total_connections = channel.sockets.len();
+
+        Log::info(format!(
+            "After subscribe - Channel: {}, Total sockets: {}, Socket: {}",
+            channel_name,
+            total_connections,
+            socket_id
+        ));
+
         Ok(JoinResponse {
             success: true,
-            channel_connections: Some(channel.subscribers.len() as i32),
+            channel_connections: Some(total_connections as i32),
+            member,
             auth_error: None,
-            member: None,
             error_message: None,
             error_code: None,
             _type: None,
         })
     }
 
-    pub fn unsubscribe(&self, socket_id: &str, channel_name: &str) {
-        Log::info(format!("Unsubscribing {} from {}", socket_id, channel_name));
+    pub async fn unsubscribe(
+        &self,
+        socket_id: &str,
+        channel_name: &str,
+        app_id: &str,
+        user_id: Option<&str>,
+    ) -> Result<LeaveResponse, Error> {
+        let socket_id_to_remove = SocketId(socket_id.to_string());
+        Log::info(format!(
+            "Starting unsubscribe for socket: {} from channel: {}",
+            socket_id_to_remove,
+            channel_name
+        ));
 
-        // First check if we need to remove the channel
-        let should_remove = {
-            if let Some(mut channel) = self.channels.get_mut(channel_name) {
-                Log::info(format!("Channel before: {:?}", channel));
-                channel.subscribers.remove(socket_id);
-                channel.subscribers.is_empty()
+        // Get channel with shorter lock scope
+        let channel = {
+            let mut connection_manager = self.connection_manager.lock().await;
+            match connection_manager.get_channel(app_id, channel_name) {
+                Some(channel) => channel,
+                None => return Ok(LeaveResponse {
+                    left: false,
+                    remaining_connections: None,
+                    member: None,
+                }),
+            }
+        };
+
+        // Log channel state before changes
+        Log::info(format!(
+            "Before unsubscribe - Channel: {}, Sockets: {:?}",
+            channel_name,
+            channel.sockets.len()
+        ));
+
+        // Handle presence channel logic first
+        let member = if ChannelType::from_name(channel_name) == ChannelType::Presence {
+            if let Some(user_id) = user_id {
+                let member = if let Some(ref members) = channel.presence_members {
+                    members.get(user_id).map(|m| m.value().clone())
+                } else {
+                    None
+                };
+
+                if let Some(ref members) = channel.presence_members {
+                    members.remove(user_id);
+                }
+
+                member.map(|m| PresenceMember {
+                    user_id: m.user_id,
+                    user_info: m.user_info.unwrap_or_default(),
+                    socket_id: Some(socket_id.to_string()),
+                })
             } else {
-                false
+                Log::warning(format!(
+                    "No user_id provided for presence channel unsubscribe: {}",
+                    channel_name
+                ));
+                None
             }
-        }; // The mut reference is dropped here
+        } else {
+            None
+        };
 
-        if should_remove {
-            Log::info(format!("Removing empty channel: {}", channel_name));
-            match self.channels.remove(channel_name) {
-                Some(_) => Log::info(format!("Channel {} removed", channel_name)),
-                None => Log::info(format!("Channel {} not found", channel_name)),
-            }
+        // Atomic remove operation
+        let socket_removed = channel.sockets.remove(&socket_id_to_remove);
+        let remaining_connections = channel.sockets.len();
+
+        Log::info(format!(
+            "After socket removal - Channel: {}, Socket: {}, Removed: {}, Remaining: {}",
+            channel_name,
+            socket_id_to_remove,
+            socket_removed.is_some(),
+            remaining_connections
+        ));
+
+        // Check if channel should be removed
+        if remaining_connections == 0 {
+            let mut connection_manager = self.connection_manager.lock().await;
+            connection_manager.remove_channel(app_id, channel_name);
+            Log::info(format!("Removed empty channel: {}", channel_name));
         }
 
-        // Log final state
-        if let Some(channel) = self.channels.get(channel_name) {
-            Log::info(format!("Channel after: {:?}", channel));
-        }
+        Ok(LeaveResponse {
+            left: socket_removed.is_some(),
+            remaining_connections: Some(remaining_connections),
+            member,
+        })
     }
 
-    pub fn remove_connection(&self, socket_id: &str) {
-        // Remove connection from all channels
-        let channels: Vec<String> = self
-            .channels
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        for channel_name in channels {
-            self.unsubscribe(socket_id, &channel_name);
-        }
-    }
-
-    pub fn get_channel_subscribers(&self, channel_name: &str) -> Option<Vec<String>> {
-        self.channels
-            .get(channel_name)
-            .map(|channel| channel.subscribers.keys().cloned().collect())
-    }
-
-    pub fn is_client_subscribed(&self, socket_id: &str, channel_name: &str) -> bool {
-        self.channels
-            .get(channel_name)
-            .map(|channel| channel.subscribers.contains_key(socket_id))
-            .unwrap_or(false)
-    }
-
+    // Helper method to parse presence data
     fn parse_presence_data(&self, data: &Option<MessageData>) -> Result<PresenceMember, Error> {
         let channel_data = data
             .as_ref()
-            .ok_or_else(|| Error::ChannelError("Missing presence channel data".to_string()))?;
+            .ok_or_else(|| Error::ChannelError("Missing presence data".into()))?;
+
         match channel_data {
             MessageData::Structured {
-                user_data,
                 channel_data,
-                channel,
                 extra,
+                ..
             } => {
-                Log::info(format!("channel_data: {:?}", channel_data.clone()));
-                let channel_data: Value =
-                    serde_json::from_str(channel_data.clone().unwrap().as_str()).unwrap();
-                let user_id = channel_data
-                    .get("user_id")
-                    .ok_or_else(|| {
-                        Error::ChannelError("Missing user_id in presence data".to_string())
-                    })?
-                    .as_str()
-                    .ok_or_else(|| {
-                        Error::ChannelError("Invalid user_id in presence data".to_string())
-                    })?
-                    .to_string();
-                let user_info = channel_data.get("user_info").cloned().unwrap_or_default();
-                let socket_id = extra
-                    .get("socket_id")
-                    .map(|s| s.as_str().unwrap().to_string());
-                Ok(PresenceMember {
-                    user_id,
-                    user_info,
-                    socket_id,
-                })
+                let data: Value = serde_json::from_str(
+                    channel_data
+                        .as_ref()
+                        .ok_or_else(|| Error::ChannelError("Missing channel_data".into()))?,
+                )?;
+
+                self.extract_presence_member(&data, extra)
             }
-            MessageData::Json(data) => {
-                let user_id = data
-                    .get("user_id")
-                    .ok_or_else(|| {
-                        Error::ChannelError("Missing user_id in presence data".to_string())
-                    })?
-                    .as_str()
-                    .ok_or_else(|| {
-                        Error::ChannelError("Invalid user_id in presence data".to_string())
-                    })?
-                    .to_string();
-                let user_info = data.get("user_info").cloned().unwrap_or_default();
-                let socket_id = data
-                    .get("socket_id")
-                    .map(|s| s.as_str().unwrap().to_string());
-                Ok(PresenceMember {
-                    user_id,
-                    user_info,
-                    socket_id,
-                })
-            }
-            _ => Err(Error::ChannelError(
-                "Invalid presence channel data".to_string(),
-            )),
+            MessageData::Json(data) => self.extract_presence_member(data, &Default::default()),
+            _ => Err(Error::ChannelError("Invalid presence data format".into())),
         }
     }
 
-    pub(crate) fn get_presence_data(&self, channel: &Channel) -> PresenceData {
-        let mut ids = Vec::new();
-        let mut hash = HashMap::new();
-
-        for sub in channel.subscribers.values() {
-            if let Some(presence_info) = &sub.presence_info {
-                ids.push(presence_info.user_id.clone());
-                if let Some(user_info) = &presence_info.user_info {
-                    hash.insert(presence_info.user_id.clone(), user_info.clone());
-                }
-            }
-        }
-
-        PresenceData { ids, hash }
-    }
-
-    // Broadcasting methods
-    pub async fn broadcast_to_channel(
+    // Helper to extract presence member info
+    fn extract_presence_member(
         &self,
-        app_id: &str,
-        connection_manager: &Arc<Mutex<ConnectionManager>>,
-        channel_name: &str,
-        event: String,
-        data: Value,
-        except_socket_id: Option<&str>,
-    ) -> Result<(), Error> {
-        let message = PusherMessage {
-            channel: Option::from(channel_name.to_string()),
-            data: Option::from(MessageData::Json(data)),
-            name: Option::from(event.clone()),
-            event: Option::from(event),
-        };
+        data: &Value,
+        extra: &HashMap<String, Value>,
+    ) -> Result<PresenceMember, Error> {
+        let user_id = data
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::ChannelError("Invalid user_id".into()))?
+            .to_string();
 
-        if let Some(channel) = self.channels.get(channel_name) {
-            //log channel subscribers
-            Log::info(format!(
-                "Channel subscribers: {:?}",
-                channel.subscribers.clone()
-            ));
-            for (socket_id, _) in channel.subscribers.iter() {
-                if Some(socket_id.as_str()) != except_socket_id {
-                    if let Err(e) = connection_manager
-                        .lock()
-                        .await
-                        .send_message(app_id, &SocketId(socket_id.to_string()), message.clone())
-                        .await
-                    {
-                        tracing::error!("Failed to send message to {}: {}", socket_id, e);
-                        // Continue sending to other subscribers even if one fails
-                        continue;
-                    }
-                }
-            }
-        }
-        Log::info("Finished");
-        Ok(())
-    }
+        let user_info = data.get("user_info").cloned().unwrap_or_default();
 
-    pub fn get_channel_type(&self, channel_name: &str) -> Option<ChannelType> {
-        self.channels
-            .get(channel_name)
-            .map(|c| c.channel_type.clone())
+        let socket_id = extra
+            .get("socket_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        Ok(PresenceMember {
+            user_id,
+            user_info,
+            socket_id,
+        })
     }
 
     pub fn signature_is_valid(
@@ -314,7 +289,7 @@ impl ChannelManager {
         message: PusherMessage,
     ) -> bool {
         let expected = Self::get_expected_signature(app_config, socket_id, message);
-        *signature == expected
+        secure_compare(signature, &expected)
     }
     pub fn get_expected_signature(
         app_config: AppConfig,
@@ -355,14 +330,5 @@ impl ChannelManager {
             }
             _ => panic!("Invalid message data"),
         }
-    }
-    pub async fn get_channel_sockets(&self, channel: &str) -> Vec<SocketId> {
-        let mut sockets = Vec::new();
-        if let Some(channel) = self.channels.get(channel) {
-            for (socket_id, _) in channel.subscribers.iter() {
-                sockets.push(SocketId(socket_id.clone()));
-            }
-        }
-        sockets
     }
 }
