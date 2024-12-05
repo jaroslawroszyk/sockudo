@@ -2,7 +2,7 @@ use crate::channel::PresenceMemberInfo;
 use crate::connection::state::SocketId;
 use crate::error::{Error, Result};
 use crate::log::Log;
-use crate::namespace::{ChannelData, Connection, Namespace};
+use crate::namespace::{Connection, Namespace};
 use crate::protocol::messages::PusherMessage;
 use fastwebsockets::{Frame, Payload, WebSocketWrite};
 use hyper::upgrade::Upgraded;
@@ -45,8 +45,14 @@ impl ConnectionManager {
         socket: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
         app_id: &str,
     ) {
-        let namespace = self.get_namespace(app_id).unwrap();
-        namespace.add_connection(socket_id, socket);
+        match  self.get_namespace(app_id) {
+            Some(namespace) => {
+                namespace.add_connection(socket_id, socket);
+            }
+            None => {
+                Log::error(format!("Namespace not found: {}", app_id).as_str());
+            }
+        }
     }
 
     pub fn get_connection(
@@ -55,13 +61,18 @@ impl ConnectionManager {
         app_id: String,
     ) -> Option<Arc<Mutex<Connection>>> {
         let namespace = self.get_namespace(&app_id).unwrap();
-        Some(namespace.get_connection(socket_id).unwrap())
+        namespace.get_connection(socket_id)
     }
 
     pub fn remove_connection(&mut self, socket_id: &SocketId, app_id: &str) {
-        self.get_namespace(app_id)
-            .unwrap()
-            .remove_connection(socket_id);
+        match self.get_namespace(app_id) {
+            Some(namespace) => {
+                namespace.remove_connection(socket_id);
+            }
+            None => {
+                Log::error(format!("Namespace not found: {}", app_id).as_str());
+            }
+        }
     }
 
     pub async fn send_message(
@@ -71,7 +82,12 @@ impl ConnectionManager {
         message: PusherMessage,
     ) -> Result<()> {
         let connection = self.get_connection(socket_id, app_id.to_string()).unwrap();
-        let message = serde_json::to_string(&message)?;
+        let message = match  serde_json::to_string(&message) {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(Error::ConnectionError(format!("Failed to serialize message: {}", e)));
+            }
+        };
         let frame = Frame::text(Payload::from(message.into_bytes()));
 
         // Get the sender without locking the entire connection
@@ -80,10 +96,12 @@ impl ConnectionManager {
             conn.message_sender.clone()
         };
 
-        // Send the frame through the channel
-        sender
-            .send(frame)
-            .map_err(|e| Error::ConnectionError(format!("Failed to send message: {}", e)))?;
+        match sender.send(frame) {
+            Ok(_) => {}
+            Err(e) => {
+                Log::error(format!("Failed to send message: {}", e).as_str());
+            }
+        }
 
         Ok(())
     }
@@ -95,10 +113,15 @@ impl ConnectionManager {
         except: Option<&SocketId>,
         app_id: &str,
     ) -> Result<()> {
-        self.get_namespace(app_id)
-            .unwrap()
-            .broadcast(channel, message, except)
-            .await
+        match  self.get_namespace(app_id) {
+            Some(namespace) => {
+                namespace.broadcast(channel, message, except).await
+            }
+            None => {
+                Log::error(format!("Namespace not found: {}", app_id).as_str());
+                Err(Error::ConnectionError("Namespace not found".to_string()))
+            }
+        }
     }
 
     pub async fn get_channel_members(
@@ -106,10 +129,8 @@ impl ConnectionManager {
         app_id: &str,
         channel: &str,
     ) -> Result<HashMap<String, PresenceMemberInfo>> {
-        Ok(self
-            .get_namespace(app_id)
-            .unwrap()
-            .get_presence_members(channel))
+        let namespace = self.get_namespace(app_id).unwrap();
+        namespace.get_channel_members(channel).await
     }
 
     pub fn get_channel_sockets(&self, channel: &str) -> Vec<SocketId> {
@@ -122,38 +143,6 @@ impl ConnectionManager {
         socket_ids.into_iter().collect()
     }
 
-    pub fn add_presence_member(
-        &mut self,
-        channel: &str,
-        user_id: &str,
-        presence_data: PresenceMemberInfo,
-        app_id: &str,
-    ) {
-        self.get_namespace(app_id)
-            .unwrap()
-            .add_presence_member(channel, user_id, presence_data);
-    }
-
-    pub fn get_presence_member(
-        &mut self,
-        channel: &str,
-        socket_id: &SocketId,
-        app_id: &str,
-    ) -> Option<PresenceMemberInfo> {
-        self.get_namespace(app_id)
-            .unwrap()
-            .get_presence_member(channel, socket_id.0.as_str())
-    }
-
-    pub fn get_presence_members(
-        &mut self,
-        channel: &str,
-        app_id: &str,
-    ) -> HashMap<String, PresenceMemberInfo> {
-        self.get_namespace(app_id)
-            .unwrap()
-            .get_presence_members(channel)
-    }
 
     pub fn get_user_connections(&mut self, user_id: &str, app_id: &str) -> Vec<SocketId> {
         self.get_namespace(app_id)
@@ -202,21 +191,15 @@ impl ConnectionManager {
         app_id: &str,
         channel: &str,
         socket_id: &SocketId,
-    ) {
+    ) -> bool {
         self.get_namespace(app_id)
             .unwrap()
-            .remove_channel_from_socket(channel, socket_id);
+            .remove_channel_from_socket(channel, socket_id)
     }
 
-    pub fn remove_presence_member(&mut self, app_id: &str, channel: &str, user_id: &str) {
-        Log::warning(format!("Removing presence member: {}", user_id).as_str());
+    pub fn get_channel(&mut self, app_id: &str, channel: &str) -> Option<HashSet<SocketId>> {
         self.get_namespace(app_id)
-            .unwrap()
-            .remove_presence_member(channel, user_id);
-    }
-
-    pub fn get_channel(&mut self, app_id: &str, channel: &str) -> Option<ChannelData> {
-        self.get_namespace(app_id).unwrap().get_channel(channel)
+            .and_then(|ns| ns.get_channel(channel))
     }
 
     pub fn remove_channel(&mut self, app_id: &str, channel: &str) {
@@ -227,5 +210,11 @@ impl ConnectionManager {
         self.get_namespace(app_id)
             .unwrap()
             .is_in_channel(channel, socket_id)
+    }
+
+    pub async fn get_presence_member(&mut self, app_id: &str, channel: &str, socket_id: &SocketId) -> Option<PresenceMemberInfo> {
+        self.get_namespace(app_id)
+            .unwrap()
+            .get_presence_member(channel, socket_id).await
     }
 }

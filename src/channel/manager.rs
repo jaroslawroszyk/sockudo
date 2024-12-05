@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing_subscriber::fmt::format;
 
 #[derive(Debug)]
 struct PresenceData {
@@ -69,27 +70,28 @@ impl ChannelManager {
         }
 
         let socket_id = SocketId(socket_id.to_string());
-
-        Log::info(format!(
-            "Subscribe request - Socket: {}, Channel: {}, Type: {:?}",
-            socket_id, channel_name, channel_type
-        ));
+        
 
         // Scope the connection_manager lock
-        let mut channel = {
-            let mut connection_manager = self.connection_manager.lock().await;
-            connection_manager.get_channel(app_id, channel_name).unwrap()
-        };
+        let mut connection_manager = self.connection_manager.lock().await;
+
+
+        Log::info(format!(
+            "Starting subscribe for socket: {} to channel: {}, app_id: {}",
+            socket_id.0, channel_name, app_id
+        ));
+
 
         // Check for existing subscription
-        if channel.sockets.contains(&socket_id) {
+        let is_in_channel = connection_manager.is_in_channel(app_id, channel_name, &socket_id);
+        if is_in_channel {
             Log::warning(format!(
                 "Socket {} already subscribed to channel {}",
                 socket_id.0, channel_name
             ));
             return Ok(JoinResponse {
                 success: true,
-                channel_connections: Some(channel.sockets.len() as i32),
+                channel_connections: Some(connection_manager.get_channel(app_id, channel_name).unwrap().len() as i32),
                 member: None,
                 auth_error: None,
                 error_message: None,
@@ -105,23 +107,14 @@ impl ChannelManager {
                 user_id: member.user_id.clone(),
                 user_info: Some(member.user_info.clone()),
             };
-
-            if let Some(ref members) = channel.presence_members {
-                members.insert(member.user_id.clone(), presence_info);
-            } else {
-                let members = DashMap::new();
-                members.insert(member.user_id.clone(), presence_info);
-                channel.presence_members = Some(members);
-            }
-
             Some(member)
         } else {
             None
         };
 
         // Atomic operation to add socket
-        channel.sockets.insert(socket_id.clone());
-        let total_connections = channel.sockets.len();
+        connection_manager.add_socket_to_channel(app_id, channel_name, &socket_id.clone());
+        let total_connections = connection_manager.get_channel(app_id, channel_name).unwrap().len();
 
         Log::info(format!(
             "After subscribe - Channel: {}, Total sockets: {}, Socket: {}",
@@ -129,6 +122,8 @@ impl ChannelManager {
             total_connections,
             socket_id
         ));
+        let channel = connection_manager.get_channel(app_id, channel_name).unwrap();
+        Log::warning(format!("After subscribe Channel: {}, Sockets: {:?}", channel_name, channel));
 
         Ok(JoinResponse {
             success: true,
@@ -155,44 +150,37 @@ impl ChannelManager {
             channel_name
         ));
 
-        // Get channel with shorter lock scope
-        let channel = {
-            let mut connection_manager = self.connection_manager.lock().await;
-            match connection_manager.get_channel(app_id, channel_name) {
-                Some(channel) => channel,
-                None => return Ok(LeaveResponse {
-                    left: false,
-                    remaining_connections: None,
-                    member: None,
-                }),
-            }
-        };
-
-        // Log channel state before changes
-        Log::info(format!(
-            "Before unsubscribe - Channel: {}, Sockets: {:?}",
-            channel_name,
-            channel.sockets.len()
-        ));
+        let mut connection_manager = self.connection_manager.lock().await;
+        Log::info("Members on line 155");
+        let members = connection_manager.get_channel_members(app_id, channel_name).await?;
+        Log::info(format!("Members: {:?}", members));
+        
 
         // Handle presence channel logic first
         let member = if ChannelType::from_name(channel_name) == ChannelType::Presence {
             if let Some(user_id) = user_id {
-                let member = if let Some(ref members) = channel.presence_members {
-                    members.get(user_id).map(|m| m.value().clone())
-                } else {
-                    None
+                let member = match  members.get(user_id) {
+                    Some(member) => {
+                        let member = PresenceMember {
+                            user_id: member.user_id.clone(),
+                            user_info: member.user_info.clone().unwrap_or_default(),
+                            socket_id: None,
+                        };
+                        member
+                    },
+                    None => {
+                        Log::warning(format!(
+                            "No user_id provided for presence channel unsubscribe: {}",
+                            channel_name
+                        ));
+                        return Ok(LeaveResponse {
+                            left: false,
+                            remaining_connections: Some(connection_manager.get_channel(app_id, channel_name).unwrap().len()),
+                            member: None,
+                        });
+                    }
                 };
-
-                if let Some(ref members) = channel.presence_members {
-                    members.remove(user_id);
-                }
-
-                member.map(|m| PresenceMember {
-                    user_id: m.user_id,
-                    user_info: m.user_info.unwrap_or_default(),
-                    socket_id: Some(socket_id.to_string()),
-                })
+                Some(member)
             } else {
                 Log::warning(format!(
                     "No user_id provided for presence channel unsubscribe: {}",
@@ -203,28 +191,27 @@ impl ChannelManager {
         } else {
             None
         };
-
+        Log::success(format!("Member: {:?}", member));
         // Atomic remove operation
-        let socket_removed = channel.sockets.remove(&socket_id_to_remove);
-        let remaining_connections = channel.sockets.len();
-
+        // list sockets before and after to check if socket was removed
+        let socket_removed = connection_manager.remove_socket_from_channel(app_id, channel_name, &socket_id_to_remove);
+        Log::success(format!("Socket removed: {:?}", socket_removed));
+        let remaining_connections = connection_manager.get_channel(app_id, channel_name).unwrap().len();
         Log::info(format!(
-            "After socket removal - Channel: {}, Socket: {}, Removed: {}, Remaining: {}",
-            channel_name,
-            socket_id_to_remove,
-            socket_removed.is_some(),
-            remaining_connections
+            "After unsubscribe - Channel: {}, Sockets: {:?}",
+            channel_name, connection_manager.get_channel(app_id, channel_name).unwrap()
         ));
 
         // Check if channel should be removed
         if remaining_connections == 0 {
-            let mut connection_manager = self.connection_manager.lock().await;
+            Log::info("Removing empty channel");
             connection_manager.remove_channel(app_id, channel_name);
             Log::info(format!("Removed empty channel: {}", channel_name));
         }
+        
 
         Ok(LeaveResponse {
-            left: socket_removed.is_some(),
+            left: socket_removed,
             remaining_connections: Some(remaining_connections),
             member,
         })
