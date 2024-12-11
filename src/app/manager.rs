@@ -27,11 +27,6 @@ impl AppManager {
     pub fn register_app(&self, config: AppConfig) {
         self.apps.insert(config.app_id.clone(), config.clone());
     }
-
-    // pub fn get_channel_manager(&self, app_id: &str) -> Option<Arc<RwLock<ChannelManager>>> {
-    //     self.channel_managers.get(app_id).map(|cm| cm.clone())
-    // }
-
     pub fn validate_key(&self, app_id: &str) -> bool {
         self.apps.contains_key(app_id)
     }

@@ -1,20 +1,20 @@
-use std::cell::Ref;
-use std::cmp::PartialEq;
+use crate::app::manager::AppManager;
 use crate::channel::PresenceMemberInfo;
 use crate::connection::state::{ConnectionState, SocketId};
 use crate::error::{Error, Result};
 use crate::log::Log;
 use crate::protocol::messages::PusherMessage;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use fastwebsockets::{Frame, Payload, WebSocketWrite};
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
+use std::cmp::PartialEq;
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 use tokio::io::WriteHalf;
 use tokio::sync::{mpsc, Mutex};
-
 // Combine all channel-related data into one structure
 
 pub struct Connection {
@@ -46,23 +46,32 @@ impl Namespace {
         }
     }
 
-    pub fn add_connection(
+    pub async fn add_connection(
         &self,
         socket_id: SocketId,
         socket: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
+        app_manager: &AppManager,
     ) {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        let connection = Connection {
-            state: ConnectionState::new("demo-key".to_string()),
+        let mut connection = Connection {
+            state: ConnectionState::new(),
             socket,
             message_sender: tx,
         };
 
-        let connection = Arc::new(Mutex::new(connection));
-        self.connections
-            .insert(socket_id.clone(), connection.clone());
+        let app = app_manager.get_app(&self.app_id).unwrap();
+        connection.state.app = Some(app);
 
+        let connection = Arc::new(Mutex::new(connection));
+
+        // First insert the connection
+        self.connections.insert(socket_id.clone(), connection.clone());
+
+        // Log that connection was added
+        Log::info(format!("Connection {} added to namespace {}", socket_id, self.app_id));
+
+        // Then spawn the message handler
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
                 let mut conn = connection.lock().await;
@@ -86,7 +95,7 @@ impl Namespace {
         let channel_data = self.channels.get(channel);
         match channel_data {
             Some(channel_data) => {
-                if channel_data.deref().contains(&socket_id) {
+                if channel_data.deref().contains(socket_id) {
                     self.get_connection(socket_id)
                 } else {
                     None
@@ -120,7 +129,8 @@ impl Namespace {
 
         // Get and collect socket IDs first, releasing the read lock
         let socket_ids: Vec<SocketId> = if let Some(channel_data) = self.channels.get(channel) {
-            channel_data.iter()
+            channel_data
+                .iter()
                 .filter(|socket_id| !except.map_or(false, |sid| sid == *socket_id))
                 .cloned()
                 .collect()
@@ -152,7 +162,7 @@ impl Namespace {
                     channel_data.deref_mut().remove(socket_id);
                 }
                 if channel_data.deref().is_empty() {
-                    drop(channel_data);  // Drop the reference before removing
+                    drop(channel_data); // Drop the reference before removing
                     self.channels.remove(channel);
                 }
             }
@@ -176,16 +186,15 @@ impl Namespace {
         for socket_id in socket_ids {
             if let Some(connection) = self.get_connection(&socket_id) {
                 // Scope the lock to only what we need
-                Log::info(format!("Getting presence data for socket {}", socket_id));
                 let presence_data = {
                     let conn = connection.lock().await;
                     conn.state.presence.clone()
                 }; // Lock is released here
-                Log::info(format!("Presence data for socket {}: {:?}", socket_id, presence_data));
-                // Process data without holding any locks
+                   // Process data without holding any locks
                 if let Some(presence_map) = presence_data {
                     if let Some(presence_info) = presence_map.get(channel).cloned() {
-                        presence_members.insert(socket_id.0.clone(), presence_info);
+                        let user_id = presence_info.user_id.clone();
+                        presence_members.insert(user_id, presence_info);
                     }
                 }
             }
@@ -214,16 +223,22 @@ impl Namespace {
     pub async fn cleanup_connection(&self, socket_id: &SocketId) {
         // Send disconnect message
         if let Some(connection) = self.get_connection(socket_id) {
-            let message =
-                PusherMessage::error(4009, "You got disconnected by the application".to_string());
-            let mut conn = connection.lock().await;
-            let _ = conn
-                .socket
-                .write_frame(Frame::text(Payload::from(
-                    serde_json::to_string(&message).unwrap().into_bytes(),
-                )))
-                .await;
-            let _ = conn.socket.write_frame(Frame::close(4009, &[])).await;
+            let message = PusherMessage::error(
+                4009,
+                "You got disconnected by the application".to_string(),
+                None,
+            );
+
+            let conn = connection.lock().await;
+            // Send the error message through message_sender
+            let error_frame = Frame::text(Payload::from(
+                serde_json::to_string(&message).unwrap().into_bytes(),
+            ));
+
+            // Send close frame through message_sender
+            let close_frame = Frame::close(4009, &[]);
+            let _ = conn.message_sender.send(error_frame);
+            let _ = conn.message_sender.send(close_frame);
         }
 
         // Cleanup from channels
@@ -278,7 +293,10 @@ impl Namespace {
     }
 
     pub fn remove_channel_from_socket(&self, channel: &str, socket_id: &SocketId) -> bool {
-        Log::info(format!("Removing socket {} from channel {}", socket_id, channel));
+        Log::info(format!(
+            "Removing socket {} from channel {}",
+            socket_id, channel
+        ));
 
         if let Some(mut channel_data) = self.channels.get_mut(channel) {
             channel_data.deref_mut().remove(socket_id);
@@ -299,10 +317,7 @@ impl Namespace {
 
     pub fn get_channel(&self, channel: &str) -> Option<HashSet<SocketId>> {
         let entry = self.channels.entry(channel.to_string());
-        let channel_data = entry.or_insert_with(|| {
-            Log::info(format!("Creating new channel: {}", channel));
-            HashSet::new()
-        });
+        let channel_data = entry.or_insert_with(|| HashSet::new());
 
         Some(channel_data.value().clone())
     }
@@ -316,8 +331,12 @@ impl Namespace {
             .map_or(false, |channel_data| channel_data.contains(socket_id))
     }
 
-    pub async fn get_presence_member(&self, channel: &str, socket_id: &SocketId) -> Option<PresenceMemberInfo> {
-        let connection = self.get_connection(&&socket_id);
+    pub async fn get_presence_member(
+        &self,
+        channel: &str,
+        socket_id: &SocketId,
+    ) -> Option<PresenceMemberInfo> {
+        let connection = self.get_connection(socket_id);
         let presence_data = connection.unwrap().lock().await.state.presence.clone();
         presence_data.unwrap().get(channel).cloned()
     }

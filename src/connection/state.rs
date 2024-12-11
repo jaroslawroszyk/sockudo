@@ -1,3 +1,5 @@
+use crate::app::config::AppConfig;
+use crate::app::manager::AppManager;
 use crate::channel::PresenceMemberInfo;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -21,6 +23,12 @@ impl AsRef<str> for SocketId {
     }
 }
 
+impl Default for SocketId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SocketId {
     pub fn new() -> Self {
         Self(Self::generate_socket_id())
@@ -40,11 +48,10 @@ impl SocketId {
         format!("{}.{}", random_number(min, max), random_number(min, max))
     }
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConnectionState {
     pub socket_id: SocketId,
-    pub app_key: String,
-    pub app_id: String,
+    pub app: Option<AppConfig>,
     pub subscribed_channels: HashSet<String>,
     pub user_id: Option<String>,
     pub last_ping: String,
@@ -53,11 +60,10 @@ pub struct ConnectionState {
 }
 
 impl ConnectionState {
-    pub fn new(app_key: String) -> Self {
+    pub fn new() -> Self {
         Self {
             socket_id: SocketId::new(),
-            app_key,
-            app_id: String::new(),
+            app: None,
             subscribed_channels: HashSet::new(),
             user_id: None,
             last_ping: String::new(),
@@ -84,5 +90,12 @@ impl ConnectionState {
 
     pub fn update_ping(&mut self) {
         self.last_ping = chrono::Utc::now().to_rfc3339();
+    }
+
+    pub fn get_app_key(&self) -> String {
+        match &self.app {
+            Some(app) => app.key.clone(),
+            None => String::new(),
+        }
     }
 }

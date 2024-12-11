@@ -36,13 +36,15 @@ use crate::{
     connection::{ConnectionHandler, ConnectionManager},
     error::Result,
 };
+use connection::memory_manager::MemoryConnectionManager;
+use crate::connection::redis_manager::RedisConnectionManager;
 
 // Server state containing all managers
 #[derive(Clone)]
 struct ServerState {
     app_manager: Arc<AppManager>,
     channel_manager: Arc<RwLock<ChannelManager>>,
-    connection_manager: Arc<Mutex<ConnectionManager>>,
+    connection_manager: Arc<Mutex<Box<dyn ConnectionManager + Send + Sync>>>,
     auth_validator: Arc<AuthValidator>,
 }
 
@@ -57,11 +59,12 @@ async fn main() -> Result<()> {
         .init();
 
     // Create managers
+    let connection_manager = RedisConnectionManager::new().await?;
     let app_manager = Arc::new(AppManager::new());
-    let connection_manager = Arc::new(Mutex::new(ConnectionManager::new()));
-    let channel_manager = Arc::new(RwLock::new(ChannelManager::new(Arc::clone(
-        &connection_manager,
-    ))));
+    let connection_manager: Arc<Mutex<Box<dyn ConnectionManager + Send + Sync>>> =
+        Arc::new(Mutex::new(Box::new(connection_manager)));
+
+    let channel_manager = Arc::new(RwLock::new(ChannelManager::new(connection_manager.clone())));
     let auth_validator = Arc::new(AuthValidator::new(app_manager.clone()));
 
     // Register demo app (you would typically load this from config)

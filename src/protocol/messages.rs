@@ -133,19 +133,21 @@ impl PusherMessage {
         Self {
             event: Some("pusher_internal:subscription_succeeded".to_string()),
             channel: Some(channel),
-            data: presence_data.map(MessageData::from),
+            data: Some(MessageData::Json(
+                presence_data.unwrap_or_else(|| json!({})),
+            )),
             name: None,
         }
     }
 
-    pub fn error(code: u16, message: String) -> Self {
+    pub fn error(code: u16, message: String, channel: Option<String>) -> Self {
         Self {
             event: Some("pusher:error".to_string()),
             data: Some(MessageData::from(json!({
                 "code": code,
                 "message": message
             }))),
-            channel: None,
+            channel,
             name: None,
         }
     }
