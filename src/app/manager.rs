@@ -1,13 +1,14 @@
-use super::config::AppConfig;
+use super::config::App;
 use crate::error::Error;
-use crate::{connection::state::SocketId, log::Log};
 use dashmap::DashMap;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use crate::websocket::SocketId;
+
 type HmacSha256 = Hmac<Sha256>;
 
 pub struct AppManager {
-    apps: DashMap<String, AppConfig>,
+    apps: DashMap<String, App>,
     // channel_managers: DashMap<String, Arc<RwLock<ChannelManager>>>,
 }
 
@@ -24,21 +25,21 @@ impl AppManager {
         }
     }
 
-    pub fn register_app(&self, config: AppConfig) {
-        self.apps.insert(config.app_id.clone(), config.clone());
+    pub fn register_app(&self, config: App) {
+        self.apps.insert(config.id.clone(), config.clone());
     }
     pub fn validate_key(&self, app_id: &str) -> bool {
         self.apps.contains_key(app_id)
     }
 
-    pub fn get_app_by_key(&self, key: &str) -> Option<AppConfig> {
+    pub fn get_app_by_key(&self, key: &str) -> Option<App> {
         self.apps
             .iter()
             .find(|app| app.key == key)
             .map(|app| app.clone())
     }
 
-    pub fn get_app(&self, app_id: &str) -> Option<AppConfig> {
+    pub fn get_app(&self, app_id: &str) -> Option<App> {
         self.apps.get(app_id).map(|app| app.clone())
     }
 
@@ -68,10 +69,10 @@ impl AppManager {
     pub fn validate_channel_name(&self, app_id: &str, channel: &str) -> Result<(), Error> {
         let app = self.get_app(app_id).ok_or_else(|| Error::InvalidAppKey)?;
 
-        if channel.len() > app.max_channel_name_length {
+        if channel.len() > app.max_channel_name_length.unwrap() as usize {
             return Err(Error::ChannelError(format!(
                 "Channel name too long. Max length is {}",
-                app.max_channel_name_length
+                app.max_channel_name_length.unwrap()
             )));
         }
 
@@ -89,7 +90,7 @@ impl AppManager {
 
     pub fn can_handle_client_events(&self, app_id: &str) -> bool {
         self.get_app_by_key(app_id)
-            .map(|app| app.enable_client_events)
+            .map(|app| app.enable_client_messages)
             .unwrap_or(false)
     }
 

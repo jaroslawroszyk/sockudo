@@ -143,7 +143,7 @@ impl PusherMessage {
     pub fn error(code: u16, message: String, channel: Option<String>) -> Self {
         Self {
             event: Some("pusher:error".to_string()),
-            data: Some(MessageData::from(json!({
+            data: Some(MessageData::Json(json!({
                 "code": code,
                 "message": message
             }))),
@@ -156,7 +156,7 @@ impl PusherMessage {
         Self {
             event: Some(event.into()),
             channel: Some(channel.into()),
-            data: Some(MessageData::from(data)),
+            data: Some(MessageData::Json(data)),
             name: None,
         }
     }
@@ -165,10 +165,12 @@ impl PusherMessage {
         Self {
             event: Some("pusher_internal:member_added".to_string()),
             channel: Some(channel),
-            data: Some(MessageData::from(json!({
-                "user_id": user_id,
-                "user_info": user_info
-            }))),
+            data: Some(MessageData::Json(json!(
+                {
+                    "user_id": user_id,
+                    "user_info": user_info.unwrap_or_else(|| json!({}))
+                }
+            ))),
             name: None,
         }
     }
@@ -177,9 +179,7 @@ impl PusherMessage {
         Self {
             event: Some("pusher_internal:member_removed".to_string()),
             channel: Some(channel),
-            data: Some(MessageData::from(json!({
-                "user_id": user_id
-            }))),
+            data: Some(MessageData::Json(json!({ "user_id": user_id }))),
             name: None,
         }
     }

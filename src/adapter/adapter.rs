@@ -1,9 +1,11 @@
 use crate::app::manager::AppManager;
 use crate::channel::PresenceMemberInfo;
-use crate::connection::state::SocketId;
 use crate::error::{Error, Result};
-use crate::namespace::{Connection, Namespace};
+use crate::namespace::Namespace;
 use crate::protocol::messages::PusherMessage;
+use crate::websocket::{SocketId, WebSocket, WebSocketRef};
+use async_trait::async_trait;
+use dashmap::{DashMap, DashSet};
 use fastwebsockets::WebSocketWrite;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
@@ -12,28 +14,28 @@ use std::sync::Arc;
 use tokio::io::WriteHalf;
 use tokio::sync::Mutex;
 
-#[async_trait::async_trait]
-pub trait ConnectionManager: Send + Sync {
+#[async_trait]
+pub trait Adapter: Send + Sync {
     async fn init(&mut self);
     // Namespace management
     async fn get_namespace(&mut self, app_id: &str) -> Option<Arc<Namespace>>;
 
-    // Connection management
-    async fn add_connection(
+    // WebSocket management
+    async fn add_socket(
         &mut self,
         socket_id: SocketId,
         socket: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
         app_id: &str,
         app_manager: &AppManager,
-    );
+    ) -> Result<()>;
 
     async fn get_connection(
         &mut self,
         socket_id: &SocketId,
-        app_id: String,
-    ) -> Option<Arc<Mutex<Connection>>>;
+        app_id: &str,
+    ) -> Option<Arc<Mutex<WebSocket>>>;
 
-    async fn remove_connection(&mut self, socket_id: &SocketId, app_id: &str);
+    async fn remove_connection(&mut self, socket_id: &SocketId, app_id: &str) -> Result<()>;
 
     // Message handling
     async fn send_message(
@@ -43,56 +45,59 @@ pub trait ConnectionManager: Send + Sync {
         message: PusherMessage,
     ) -> Result<()>;
 
-    async fn broadcast(
+    async fn send(
         &mut self,
         channel: &str,
         message: PusherMessage,
         except: Option<&SocketId>,
         app_id: &str,
     ) -> Result<()>;
-
-    // Channel management
     async fn get_channel_members(
         &mut self,
         app_id: &str,
         channel: &str,
     ) -> Result<HashMap<String, PresenceMemberInfo>>;
-
-    async fn get_channel_sockets(&self, channel: &str) -> Vec<SocketId>;
-
-    async fn get_channel(&mut self, app_id: &str, channel: &str) -> Option<HashSet<SocketId>>;
-
+    async fn get_channel_sockets(
+        &mut self,
+        app_id: &str,
+        channel: &str,
+    ) -> Result<DashMap<SocketId, Arc<Mutex<WebSocket>>>>;
+    async fn get_channel(&mut self, app_id: &str, channel: &str) -> Result<DashSet<SocketId>>;
     async fn remove_channel(&mut self, app_id: &str, channel: &str);
-
-    async fn is_in_channel(&mut self, app_id: &str, channel: &str, socket_id: &SocketId) -> bool;
-
-    // User management
-    async fn get_user_connections(&mut self, user_id: &str, app_id: &str) -> Vec<SocketId>;
-
-    // Cleanup operations
-    async fn cleanup_connection(&mut self, app_id: &str, socket_id: &SocketId);
-
-    async fn terminate_connection(&mut self, app_id: &str, user_id: &str) -> Result<()>;
-
-    // Channel-socket operations
-    async fn add_channel_to_sockets(&mut self, app_id: &str, channel: &str, socket_id: &SocketId);
-
-    async fn get_channel_socket_count(&mut self, app_id: &str, channel: &str) -> usize;
-
-    async fn add_socket_to_channel(&mut self, app_id: &str, channel: &str, socket_id: &SocketId);
-
-    async fn remove_socket_from_channel(
+    async fn is_in_channel(
         &mut self,
         app_id: &str,
         channel: &str,
         socket_id: &SocketId,
-    ) -> bool;
-
-    // Presence channel operations
+    ) -> Result<bool>;
+    async fn get_user_sockets(
+        &mut self,
+        user_id: &str,
+        app_id: &str,
+    ) -> Result<DashSet<WebSocketRef>>;
+    async fn cleanup_connection(&mut self, app_id: &str, ws: WebSocketRef);
+    async fn terminate_connection(&mut self, app_id: &str, user_id: &str) -> Result<()>;
+    async fn add_channel_to_sockets(&mut self, app_id: &str, channel: &str, socket_id: &SocketId);
+    async fn get_channel_socket_count(&mut self, app_id: &str, channel: &str) -> usize;
+    async fn add_to_channel(
+        &mut self,
+        app_id: &str,
+        channel: &str,
+        socket_id: &SocketId,
+    ) -> Result<bool>;
+    async fn remove_from_channel(
+        &mut self,
+        app_id: &str,
+        channel: &str,
+        socket_id: &SocketId,
+    ) -> Result<bool>;
     async fn get_presence_member(
         &mut self,
         app_id: &str,
         channel: &str,
         socket_id: &SocketId,
     ) -> Option<PresenceMemberInfo>;
+    async fn terminate_user_connections(&mut self, app_id: &str, user_id: &str) -> Result<()>;
+    async fn add_user(&mut self, ws: Arc<Mutex<WebSocket>>) -> Result<()>;
+    async fn remove_user(&mut self, ws: Arc<Mutex<WebSocket>>) -> Result<()>;
 }

@@ -1,10 +1,42 @@
-use crate::app::config::AppConfig;
+use fastwebsockets::{Frame, WebSocketWrite};
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
+use tokio::io::WriteHalf;
+use tokio::sync::{mpsc, Mutex};
+
+pub struct WebSocket {
+    pub state: ConnectionState,
+    pub socket: Option<WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>>,
+    pub message_sender: mpsc::UnboundedSender<Frame<'static>>,
+}
+
+impl PartialEq for ConnectionState {
+    fn eq(&self, other: &Self) -> bool {
+        self.socket_id == other.socket_id
+    }
+}
+
+impl PartialEq for WebSocket {
+    fn eq(&self, other: &Self) -> bool {
+        self.state == other.state
+    }
+}
+
+impl Eq for WebSocket {
+    fn assert_receiver_is_total_eq(&self) {
+        self.state.socket_id.assert_receiver_is_total_eq();
+    }
+}
+
+use crate::app::config::App;
 use crate::app::manager::AppManager;
 use crate::channel::PresenceMemberInfo;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SocketId(pub String);
@@ -51,7 +83,7 @@ impl SocketId {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ConnectionState {
     pub socket_id: SocketId,
-    pub app: Option<AppConfig>,
+    pub app: Option<App>,
     pub subscribed_channels: HashSet<String>,
     pub user_id: Option<String>,
     pub last_ping: String,
@@ -99,3 +131,34 @@ impl ConnectionState {
         }
     }
 }
+
+impl PartialEq<String> for SocketId {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == *other
+    }
+}
+
+impl Hash for WebSocket {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.state.socket_id.hash(state);
+    }
+}
+
+#[derive(Clone)]
+pub struct WebSocketRef(pub Arc<Mutex<WebSocket>>);
+
+impl Hash for WebSocketRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Hash based on the Arc's pointer address
+        std::ptr::addr_of!(self.0).hash(state);
+    }
+}
+
+impl PartialEq for WebSocketRef {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare based on Arc pointer equality
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for WebSocketRef {}

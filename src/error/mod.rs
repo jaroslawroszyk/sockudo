@@ -13,7 +13,7 @@ pub enum Error {
     #[error("Application disabled")]
     ApplicationDisabled,
 
-    #[error("Application is over connection quota")]
+    #[error("Application is over adapter quota")]
     OverConnectionQuota,
 
     #[error("Path not found")]
@@ -117,7 +117,23 @@ pub enum Error {
     // Generic errors
     #[error("Invalid app key")]
     InvalidAppKey,
+    
+    #[error("Cache error: {0}")]
+    CacheError(String),
+    
+    #[error("Invalid JSON")]
+    SerializationError(String),
+    
+    #[error("Broadcast error: {0}")]
+    BroadcastError(String),
+    
+    #[error("Other: {0}")]
+    Other(String),
+
+    #[error("Redis error: {0}")]
+    RedisError(String),
 }
+
 
 // Add conversion to WebSocket close codes
 impl Error {
@@ -145,6 +161,8 @@ impl Error {
             // 4300-4399: Other errors
             Error::ClientEventRateLimit => 4301,
             Error::WatchlistLimitExceeded => 4302,
+            
+            Error::BroadcastError(_) => 4303,
 
             // Map other errors to appropriate ranges
             Error::ChannelError(_)

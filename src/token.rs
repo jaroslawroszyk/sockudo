@@ -42,13 +42,12 @@ impl Token {
     /// # Returns
     ///
     /// Returns the hexadecimal representation of the HMAC signature
-    pub fn sign(&self, input: String) -> String {
+    pub fn sign(&self, input: &str) -> String {
         let mut mac = HmacSha256::new_from_slice(self.secret.as_bytes())
             .expect("HMAC can take key of any size");
 
         mac.update(input.as_bytes());
-        let result = mac.finalize();
-        hex::encode(result.into_bytes())
+        hex::encode(mac.finalize().into_bytes())
     }
 
     /// Verifies if the provided signature matches the computed signature for the input
@@ -61,7 +60,18 @@ impl Token {
     /// # Returns
     ///
     /// Returns true if the signatures match, false otherwise
-    pub fn verify(&self, input: String, signature: &str) -> bool {
-        secure_compare(&self.sign(input), signature)
+    pub fn verify(&self, input: &str, signature: &str) -> bool {
+        // Create a new MAC instance and verify directly to avoid timing attacks
+        let mut mac = HmacSha256::new_from_slice(self.secret.as_bytes())
+            .expect("HMAC can take key of any size");
+
+        mac.update(input.as_bytes());
+
+        // Try to verify using the MAC's built-in verify method first
+        if let Ok(signature_bytes) = hex::decode(signature) {
+            mac.verify_slice(&signature_bytes).is_ok()
+        } else {
+            false
+        }
     }
 }

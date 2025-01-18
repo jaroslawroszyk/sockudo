@@ -4,20 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.8.1", features = ["ws"] }
 tokio = { version = "1.0", features = ["full"] }
 tower = "0.5.1"
 tower-http = { version = "0.6.1", features = ["cors"] }
-fastwebsockets = { version = "0.8.0", features = [
+fastwebsockets = { version = "0.10.0", features = [
     "upgrade",
     "with_axum",
     "unstable-split",
     "hyper-util",
     "hyper",
 ] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-thiserror = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.9"
 dashmap = "6.1.0"
 futures = "0.3.18"
 tracing = "0.1"
@@ -33,7 +33,13 @@ colored = "*"
 chrono = "*"
 sysinfo = "*"
 async-trait = "0.1.83"
-fred = "10.0.1"
+anyhow = "1.0.94"
+apalis-redis = "0.6.1"
+apalis = { version = "0.6.1", features = ["limit"] }
+redis = { version = "0.28.1", features = ["tokio-comp", "json"] }
+rayon = "1.10.0"
+
+
 
 
 [dependencies.uuid]

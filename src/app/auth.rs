@@ -1,10 +1,10 @@
 use super::manager::AppManager;
-use crate::app::config::AppConfig;
-use crate::connection::state::SocketId;
+use crate::app::config::App;
 use crate::error::Error;
 use crate::token::{secure_compare, Token};
 use serde::Deserialize;
 use std::sync::Arc;
+use crate::websocket::SocketId;
 
 #[derive(Debug, Deserialize)]
 pub struct ChannelAuth {
@@ -33,21 +33,21 @@ impl AuthValidator {
         &self,
         socket_id: SocketId,
         app_key: &str,
-        user_data: String,
-        auth: String,
+        user_data: &str,
+        auth: &str,
     ) -> Result<bool, Error> {
         let app = self.app_manager.get_app(app_key).ok_or(Error::InvalidKey)?;
         let is_valid =
-            self.sign_in_token_is_valid(socket_id.0, user_data, auth.to_string(), app.clone());
+            self.sign_in_token_is_valid(socket_id.0.as_str(), user_data, auth, app.clone());
         Ok(is_valid)
     }
 
     pub fn sign_in_token_is_valid(
         &self,
-        socket_id: String,
-        user_data: String,
-        expected_signature: String,
-        app_config: AppConfig,
+        socket_id: &str,
+        user_data: &str,
+        expected_signature: &str,
+        app_config: App,
     ) -> bool {
         let signature = self.sing_in_token_for_user_data(socket_id, user_data, app_config);
         secure_compare(&signature, &expected_signature)
@@ -55,12 +55,12 @@ impl AuthValidator {
 
     pub fn sing_in_token_for_user_data(
         &self,
-        socket_id: String,
-        user_data: String,
-        app_config: AppConfig,
+        socket_id: &str,
+        user_data: &str,
+        app_config: App,
     ) -> String {
         let decoded_string = format!("{}::user::{}", socket_id, user_data);
         let signature = Token::new(app_config.key, app_config.secret);
-        signature.sign(decoded_string)
+        signature.sign(&*decoded_string)
     }
 }
