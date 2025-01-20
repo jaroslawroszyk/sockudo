@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
 
     let app_manager = Arc::new(AppManager::new());
    
-    let connection_manager = RedisAdapter::new("redis://127.0.0.1/", "pusher").await?;
+    let connection_manager = LocalAdapter::new();
     // let connection_manager = LocalAdapter::new();
     let connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>> =
         Arc::new(Mutex::new(Box::new(connection_manager)));

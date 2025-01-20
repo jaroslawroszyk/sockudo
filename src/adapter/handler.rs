@@ -3,7 +3,6 @@ use crate::app::auth::AuthValidator;
 use crate::app::config::App;
 use crate::app::manager::AppManager;
 use crate::cache::manager::CacheManager;
-use crate::cache::redis_cache_manager::RedisCacheManager;
 use crate::channel::{ChannelType, PresenceMemberInfo};
 use crate::log::Log;
 use crate::protocol::messages::{ErrorData, MessageData, PusherApiMessage, PusherMessage};
