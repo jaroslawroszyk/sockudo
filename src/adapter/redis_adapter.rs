@@ -1,5 +1,24 @@
-use crate::adapter::local_adapter::LocalAdapter;
-use crate::adapter::Adapter;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use dashmap::{DashMap, DashSet};
+use fastwebsockets::WebSocketWrite;
+use futures::StreamExt;
+use hyper::upgrade::Upgraded;
+use hyper_util::rt::TokioIo;
+use redis::{AsyncCommands, AsyncConnectionConfig};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tokio::io::WriteHalf;
+use tokio::sync::{Mutex, mpsc};
+use uuid::Uuid;
+
+use crate::adapter::adapter::Adapter;
+use crate::adapter::horizontal_adapter::{
+    BroadcastMessage, HorizontalAdapter, RequestBody, RequestType, ResponseBody,
+};
 use crate::app::manager::AppManager;
 use crate::channel::PresenceMemberInfo;
 use crate::error::{Error, Result};
@@ -7,146 +26,381 @@ use crate::log::Log;
 use crate::namespace::Namespace;
 use crate::protocol::messages::PusherMessage;
 use crate::websocket::{SocketId, WebSocket, WebSocketRef};
-use dashmap::{DashMap, DashSet};
-use fastwebsockets::WebSocketWrite;
-use futures::StreamExt;
-use hyper::upgrade::Upgraded;
-use hyper_util::rt::TokioIo;
-use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::io::WriteHalf;
-use tokio::sync::Mutex;
-use tracing_subscriber::fmt::format;
-use uuid::Uuid;
 
-#[derive(Serialize, Deserialize)]
-struct RedisMessage {
-    channel: String,
-    message: PusherMessage,
-    except: Option<SocketId>,
-    app_id: String,
-    node_id: String,
-    socket_id: SocketId,
-}
+/// Redis channels
+pub const DEFAULT_PREFIX: &str = "sockudo";
+const BROADCAST_SUFFIX: &str = "#broadcast";
+const REQUESTS_SUFFIX: &str = "#requests";
+const RESPONSES_SUFFIX: &str = "#responses";
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct BroadcastMessage {
-    node_id: String,
-    channel: String,
-    socket_id: SocketId,
-    message: String,
-    app_id: String,
-}
-
-#[derive(Clone)]
-pub struct RedisAdapter {
-    pub pub_client: redis::Client,
-    pub pub_connection: redis::aio::MultiplexedConnection,
-    pub sub_client: redis::Client,
-    pub sub_connection: redis::aio::MultiplexedConnection,
-    pub local_adapter: LocalAdapter,
-    pub channel: String,
+/// Redis adapter configuration
+#[derive(Debug, Clone)]
+pub struct RedisAdapterConfig {
+    /// Redis URL
+    pub url: String,
+    /// Channel prefix
     pub prefix: String,
-    pub node_id: String,
+    /// Request timeout in milliseconds
+    pub request_timeout_ms: u64,
+    /// Use connection manager for auto-reconnection
+    pub use_connection_manager: bool,
+    /// Cluster mode (for Redis Cluster)
+    pub cluster_mode: bool,
 }
 
-impl RedisAdapter {
-    pub async fn new(redis_url: &str, prefix: &str) -> Result<Self> {
-        let pub_client = redis::Client::open(redis_url)
-            .map_err(|e| Error::RedisError(format!("Failed to open pub client: {}", e)))?;
-        let pub_connection = pub_client
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(|e| Error::RedisError(format!("Failed to connect pub client: {}", e)))?;
-
-        let sub_client = redis::Client::open(redis_url)
-            .map_err(|e| Error::RedisError(format!("Failed to open sub client: {}", e)))?;
-        let sub_connection = sub_client
-            .get_multiplexed_tokio_connection()
-            .await
-            .map_err(|e| Error::RedisError(format!("Failed to connect sub client: {}", e)))?;
-
-        let local_adapter = LocalAdapter::new();
-
-        let adapter = Self {
-            pub_client,
-            pub_connection,
-            sub_client,
-            sub_connection,
-            local_adapter,
-            channel: "redis-adapter".to_string(),
-            prefix: prefix.to_string(),
-            node_id: Uuid::new_v4().to_string(),
-        };
-
-        tokio::spawn(adapter.clone().handle_redis_messages());
-
-        Ok(adapter)
-    }
-
-    async fn handle_redis_messages(mut self) {
-        let mut pubsub = self
-            .sub_client
-            .get_async_pubsub()
-            .await
-            .map_err(|e| Error::RedisError(format!("Failed to get pubsub: {}", e)))
-            .unwrap();
-
-        let channel = format!("{}#{}", self.prefix, self.channel);
-        Log::info(&format!("Subscribing to Redis channel: {}", channel));
-        pubsub
-            .subscribe(&channel)
-            .await
-            .map_err(|e| Error::RedisError(format!("Failed to subscribe: {}", e)))
-            .unwrap();
-
-        let mut messages = pubsub.on_message();
-
-        while let Some(msg) = messages.next().await {
-            let payload: String = msg.get_payload().unwrap();
-            Log::info(format!("Received Redis message: {}", payload)); // More detailed logging
-
-            match serde_json::from_str::<BroadcastMessage>(&payload) {
-                Ok(redis_msg) => {
-                    if redis_msg.node_id == self.node_id {
-                        continue;
-                    }
-
-                    match serde_json::from_str(&redis_msg.message) {
-                        Ok(message) => {
-                            if let Err(e) = self
-                                .send(
-                                    &redis_msg.channel,
-                                    message,
-                                    Some(&redis_msg.socket_id),
-                                    &redis_msg.app_id,
-                                )
-                                .await
-                            {
-                                Log::error(format!("Failed to send message locally: {}", e));
-                            }
-                        }
-                        Err(e) => Log::error(format!("Failed to deserialize message: {}", e)),
-                    }
-                }
-                Err(e) => Log::error(format!("Failed to deserialize Redis message: {}", e)),
-            }
+impl Default for RedisAdapterConfig {
+    fn default() -> Self {
+        Self {
+            url: "redis://127.0.0.1:6379/".to_string(),
+            prefix: DEFAULT_PREFIX.to_string(),
+            request_timeout_ms: 5000,
+            use_connection_manager: true,
+            cluster_mode: false,
         }
     }
 }
 
-#[async_trait::async_trait]
-impl Adapter for RedisAdapter {
-    // Initialize the adapter
-    async fn init(&mut self) {
-        self.local_adapter.init().await;
+/// Redis adapter for horizontal scaling (Optimized Version)
+pub struct RedisAdapter {
+    /// Base horizontal adapter (protected by a Mutex)
+    /// Optimization Note: While the Mutex remains, methods now try to minimize lock duration.
+    /// Further optimization would require refactoring HorizontalAdapter internals.
+    pub horizontal: Arc<Mutex<HorizontalAdapter>>,
+
+    /// Redis client
+    pub client: redis::Client,
+
+    /// Redis connection for publishing (Multiplexed for efficiency)
+    pub connection: redis::aio::MultiplexedConnection,
+
+    /// Channel names
+    pub prefix: String,
+    pub broadcast_channel: String,
+    pub request_channel: String,
+    pub response_channel: String,
+
+    /// Configuration
+    pub config: RedisAdapterConfig,
+}
+
+impl RedisAdapter {
+    /// Create a new Redis adapter
+    pub async fn new(config: RedisAdapterConfig) -> Result<Self> {
+        // Create the base horizontal adapter
+        let mut horizontal = HorizontalAdapter::new();
+        Log::info(format!("Redis adapter config: {:?}", config));
+
+        // Set timeout
+        horizontal.requests_timeout = config.request_timeout_ms;
+
+        // Create Redis client
+        let client = redis::Client::open(&*config.url)
+            .map_err(|e| Error::RedisError(format!("Failed to create Redis client: {}", e)))?;
+
+        // Get connection based on configuration
+        let connection = if config.use_connection_manager {
+            client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| Error::RedisError(format!("Failed to create connection manager: {}", e)))?
+        } else {
+            client
+                .get_multiplexed_tokio_connection()
+                .await
+                .map_err(|e| Error::RedisError(format!("Failed to connect to Redis: {}", e)))?
+        };
+
+        // Build channel names
+        let broadcast_channel = format!("{}:{}", config.prefix, BROADCAST_SUFFIX);
+        let request_channel = format!("{}:{}", config.prefix, REQUESTS_SUFFIX);
+        let response_channel = format!("{}:{}", config.prefix, RESPONSES_SUFFIX);
+
+        // Create the adapter
+        let adapter = Self {
+            horizontal: Arc::new(Mutex::new(horizontal)),
+            client,
+            connection,
+            prefix: config.prefix.clone(),
+            broadcast_channel,
+            request_channel,
+            response_channel,
+            config,
+        };
+
+        Ok(adapter)
     }
 
-    // Delegate most methods to local adapter
+    /// Create a new Redis adapter with simple configuration
+    pub async fn with_url(redis_url: &str) -> Result<Self> {
+        let config = RedisAdapterConfig {
+            url: redis_url.to_string(),
+            ..Default::default()
+        };
+        Self::new(config).await
+    }
+
+    /// Start listening for Redis messages
+    pub async fn start_listeners(&self) -> Result<()> {
+        // Lock needed only for starting cleanup task
+        {
+            let mut horizontal = self.horizontal.lock().await;
+            // Start cleanup task
+            horizontal.start_request_cleanup();
+        } // Lock released here
+
+        // Start PubSub listeners
+        self.start_listeners_pubsub().await?;
+
+        Ok(())
+    }
+
+    /// Start traditional PubSub listeners (Optimized with task spawning)
+    async fn start_listeners_pubsub(&self) -> Result<()> {
+        // Create a subscription connection (separate from the multiplexed one)
+        let sub_client = self.client.clone();
+
+        // Clone needed values for the async task
+        // Clone Arc for cheap sharing across tasks
+        let horizontal_arc = self.horizontal.clone();
+        let pub_connection = self.connection.clone();
+        let broadcast_channel = self.broadcast_channel.clone();
+        let request_channel = self.request_channel.clone();
+        let response_channel = self.response_channel.clone();
+
+        // Get node_id without holding the lock for the whole setup
+        let node_id = {
+            let horizontal_lock = horizontal_arc.lock().await;
+            horizontal_lock.node_id.clone()
+        }; // Lock released
+
+        // Spawn the main listener task
+        tokio::spawn(async move {
+            // Create a pubsub connection
+            let mut pubsub = match sub_client.get_async_pubsub().await {
+                Ok(pubsub) => pubsub,
+                Err(e) => {
+                    Log::error(format!("Failed to get pubsub connection: {}", e));
+                    // Consider adding retry logic or more robust error handling here
+                    return;
+                }
+            };
+
+            // Subscribe to all channels
+            // Using psubscribe for potential pattern matching flexibility if needed later,
+            // but currently checking exact channel names.
+            if let Err(e) = pubsub
+                .subscribe(&[&broadcast_channel, &request_channel, &response_channel])
+                .await
+            {
+                Log::error(format!("Failed to subscribe to channels: {}", e));
+                return;
+            }
+
+            Log::info(format!(
+                "Redis adapter listening on channels: {}, {}, {}",
+                broadcast_channel, request_channel, response_channel
+            ));
+
+            // Listen for messages
+            let mut message_stream = pubsub.on_message();
+
+            while let Some(msg) = message_stream.next().await {
+                let channel: String = msg.get_channel_name().to_string();
+                let payload_result: redis::RedisResult<String> = msg.get_payload();
+
+                if let Ok(payload) = payload_result {
+                    // --- Optimization: Process each message type in its own task ---
+                    let horizontal_clone = horizontal_arc.clone();
+                    let node_id_clone = node_id.clone();
+                    let pub_connection_clone = pub_connection.clone();
+                    let broadcast_channel_clone = broadcast_channel.clone();
+                    let request_channel_clone = request_channel.clone();
+                    let response_channel_clone = response_channel.clone();
+
+                    tokio::spawn(async move {
+                        // Process based on channel name
+                        if channel == broadcast_channel_clone {
+                            // Handle broadcast message
+                            match serde_json::from_str::<BroadcastMessage>(&payload) {
+                                Ok(broadcast) => {
+                                    // Skip our own messages
+                                    if broadcast.node_id == node_id_clone {
+                                        return;
+                                    }
+                                    // Process the broadcast
+                                    match serde_json::from_str(&broadcast.message) {
+                                        Ok(message) => {
+                                            let except_id = broadcast
+                                                .except_socket_id
+                                                .as_ref()
+                                                .map(|id| SocketId(id.clone()));
+                                            // Lock only when interacting with local adapter
+                                            let mut horizontal_lock = horizontal_clone.lock().await;
+                                            let _ = horizontal_lock
+                                                .local_adapter
+                                                .send(
+                                                    &broadcast.channel,
+                                                    message,
+                                                    except_id.as_ref(),
+                                                    &broadcast.app_id,
+                                                )
+                                                .await;
+                                            // Lock released automatically when horizontal_lock goes out of scope
+                                        }
+                                        Err(e) => {
+                                            Log::warning(format!(
+                                                "Failed to deserialize broadcast inner message: {}, Payload: {}",
+                                                e, broadcast.message
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    Log::warning(format!(
+                                        "Failed to deserialize broadcast message: {}, Payload: {}",
+                                        e, payload
+                                    ));
+                                }
+                            }
+                        } else if channel == request_channel_clone {
+                            // Handle request message
+                            match serde_json::from_str::<RequestBody>(&payload) {
+                                Ok(request) => {
+                                    // Skip our own requests
+                                    if request.node_id == node_id_clone {
+                                        return;
+                                    }
+                                    // Process the request (already designed to be async)
+                                    // Lock only when processing
+                                    let response = { // Scope for the lock
+                                        let mut horizontal_lock = horizontal_clone.lock().await;
+                                        horizontal_lock.process_request(request).await
+                                    }; // Lock released
+                                    if let Ok(response) = response {
+                                        // Send response
+                                        match serde_json::to_string(&response) {
+                                            Ok(response_json) => {
+                                                let mut conn = pub_connection_clone.clone();
+                                                if let Err(e) = conn.publish::<_, _, ()>(&response_channel_clone, response_json).await {
+                                                    Log::error(format!("Failed to publish response: {}", e));
+                                                }
+                                            }
+                                            Err(e) => {
+                                                Log::error(format!("Failed to serialize response: {}", e));
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    Log::warning(format!(
+                                        "Failed to deserialize request message: {}, Payload: {}",
+                                        e, payload
+                                    ));
+                                }
+                            }
+                        } else if channel == response_channel_clone {
+                            // Handle response message
+                            match serde_json::from_str::<ResponseBody>(&payload) {
+                                Ok(response) => {
+                                    // Skip our own responses
+                                    if response.node_id == node_id_clone {
+                                        return;
+                                    }
+                                    // Process the response (already designed to be async)
+                                    // Lock only when processing
+                                    let mut horizontal_lock = horizontal_clone.lock().await;
+                                    let _ = horizontal_lock.process_response(response).await;
+                                    // Lock released automatically
+                                }
+                                Err(e) => {
+                                    Log::warning(format!(
+                                        "Failed to deserialize response message: {}, Payload: {}",
+                                        e, payload
+                                    ));
+                                }
+                            }
+                        }
+                    }); // End of spawned task for message processing
+                } else if let Err(e) = payload_result {
+                    Log::error(format!("Failed to get payload from Redis message: {}", e));
+                }
+            }
+            Log::info("Redis Pub/Sub listener stream ended.");
+        });
+
+        Ok(())
+    }
+
+    /// Get the number of nodes in the cluster (Optimized parsing)
+    pub async fn get_node_count(&self) -> Result<usize> {
+        if self.config.cluster_mode {
+            // TODO: Implement actual Redis Cluster node counting logic
+            // This requires querying CLUSTER NODES and potentially aggregating
+            // PUBSUB NUMSUB results from multiple nodes. It's complex.
+            Log::warning("Cluster mode node count is not fully implemented, returning placeholder.");
+            Ok(5) // Placeholder
+        } else {
+            // Use a cloned connection for the command
+            let mut conn = self.connection.clone();
+
+            // Use the PUBSUB NUMSUB command directly
+            let result: redis::RedisResult<Vec<redis::Value>> = redis::cmd("PUBSUB")
+                .arg("NUMSUB")
+                .arg(&self.request_channel)
+                .query_async(&mut conn)
+                .await;
+
+            match result {
+                Ok(values) => {
+                    // PUBSUB NUMSUB returns [channel, count] format for a single channel
+                    // Or [] if channel doesn't exist or has no subscribers (unlikely for request channel)
+                    if values.len() >= 2 {
+                        if let redis::Value::Int(count) = values[1] {
+                            // Ensure at least 1 node (ourselves)
+                            Ok((count as usize).max(1))
+                        } else {
+                            Log::warning(format!("Failed to parse PUBSUB NUMSUB count (not an Int): {:?}", values));
+                            Ok(1) // Default to 1 on unexpected format
+                        }
+                    } else {
+                        Log::warning(format!("PUBSUB NUMSUB returned unexpected result format: {:?}", values));
+                        Ok(1) // Default to 1 if format is wrong (e.g., channel not found)
+                    }
+                }
+                Err(e) => {
+                    // Log the error but default to 1 node to avoid breaking logic that relies on node count
+                    Log::error(format!("Failed to execute PUBSUB NUMSUB: {}", e));
+                    Ok(1) // Default to 1 node on error
+                }
+            }
+        }
+    }
+
+    // --- Adapter Trait Implementation ---
+    // Most methods primarily delegate to horizontal adapter.
+    // Optimization focuses on minimizing lock duration where possible,
+    // especially in methods that perform both local actions and remote communication.
+    
+}
+
+#[async_trait]
+impl Adapter for RedisAdapter {
+    async fn init(&mut self) {
+        // Lock scope minimized
+        {
+            let mut horizontal = self.horizontal.lock().await;
+            horizontal.local_adapter.init().await;
+        } // Lock released
+
+        // Start Redis listeners (already optimized)
+        if let Err(e) = self.start_listeners().await {
+            Log::error(format!("Failed to start Redis listeners: {}", e));
+            // Consider returning the error or handling it more gracefully
+        }
+    }
     async fn get_namespace(&mut self, app_id: &str) -> Option<Arc<Namespace>> {
-        self.local_adapter.get_namespace(app_id).await
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal.local_adapter.get_namespace(app_id).await
     }
 
     async fn add_socket(
@@ -156,7 +410,9 @@ impl Adapter for RedisAdapter {
         app_id: &str,
         app_manager: &AppManager,
     ) -> Result<()> {
-        self.local_adapter
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
             .add_socket(socket_id, socket, app_id, app_manager)
             .await
     }
@@ -166,30 +422,36 @@ impl Adapter for RedisAdapter {
         socket_id: &SocketId,
         app_id: &str,
     ) -> Option<Arc<Mutex<WebSocket>>> {
-        self.local_adapter.get_connection(socket_id, app_id).await
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
+            .get_connection(socket_id, app_id)
+            .await
     }
 
     async fn remove_connection(&mut self, socket_id: &SocketId, app_id: &str) -> Result<()> {
-        self.local_adapter
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
             .remove_connection(socket_id, app_id)
             .await
     }
 
-    // Delegate remaining methods to local adapter
     async fn send_message(
         &mut self,
         app_id: &str,
         socket_id: &SocketId,
         message: PusherMessage,
     ) -> Result<()> {
-        self.local_adapter
+        // This likely sends directly to a specific socket, lock scope depends on local_adapter.
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
             .send_message(app_id, socket_id, message)
             .await
-            .expect("TODO: panic message");
-        Ok(())
     }
 
-    // The key method - publishing messages to Redis
+    /// Send to a channel (Optimized Lock Scope)
     async fn send(
         &mut self,
         channel: &str,
@@ -197,69 +459,146 @@ impl Adapter for RedisAdapter {
         except: Option<&SocketId>,
         app_id: &str,
     ) -> Result<()> {
-        self.local_adapter
-            .send(channel, message.clone(), except, app_id)
-            .await?;
+        // --- Optimization: Minimize lock duration ---
+        let (node_id, broadcast_data) = {
+            // 1. Lock and perform local send
+            let mut horizontal_lock = self.horizontal.lock().await;
+            let local_send_result = horizontal_lock
+                .local_adapter
+                .send(channel, message.clone(), except, app_id)
+                .await;
 
-        if let Some(namespace) = self.get_namespace(app_id).await {
-            if let Err(e) = namespace.broadcast(channel, message.clone(), except).await {
-                Log::error(format!("Failed to broadcast to namespace: {}", e));
+            // Log local send errors if necessary, but continue to broadcast
+            if let Err(e) = local_send_result {
+                Log::warning_title(format!("Local send failed during broadcast for channel {}: {}", channel, e));
             }
-        }
 
-        let broadcast_msg = BroadcastMessage {
-            node_id: self.node_id.clone(),
-            channel: channel.to_string(),
-            socket_id: except.cloned().unwrap_or_else(|| SocketId("".to_string())),
-            message: serde_json::to_string(&message).map_err(|e| {
-                Error::SerializationError(format!("Failed to serialize message: {}", e))
-            })?,
-            app_id: app_id.to_string(),
+            // 2. Prepare data needed for broadcast *outside* the lock
+            (
+                horizontal_lock.node_id.clone(),
+                (
+                    app_id.to_string(),
+                    channel.to_string(),
+                    except.map(|id| id.0.clone()),
+                ),
+            )
+            // 3. Lock released here
         };
 
-        self.pub_connection
-            .publish(
-                format!("{}#{}", self.prefix, self.channel), // Use prefixed channel here as well
-                serde_json::to_string(&broadcast_msg).map_err(|e| {
-                    Error::SerializationError(format!("Failed to serialize message: {}", e))
-                })?,
-            )
+        // 4. Serialize the original message (outside the lock)
+        let message_json = serde_json::to_string(&message)?;
+
+        // 5. Create broadcast message (outside the lock)
+        let broadcast = BroadcastMessage {
+            node_id, // Cloned node_id
+            app_id: broadcast_data.0,
+            channel: broadcast_data.1,
+            message: message_json, // Serialized message
+            except_socket_id: broadcast_data.2,
+        };
+        
+        Log::info(format!("Broadcasting message: {:?}", broadcast));
+
+        // 6. Serialize broadcast message (outside the lock)
+        let broadcast_json = serde_json::to_string(&broadcast)?;
+
+        // 7. Publish to Redis (outside the lock)
+        let mut conn = self.connection.clone();
+        conn.publish::<_, _, ()>(&self.broadcast_channel, broadcast_json)
             .await
-            .map_err(|e| Error::RedisError(format!("Failed to publish: {}", e)))?;
+            .map_err(|e| Error::RedisError(format!("Failed to publish broadcast: {}", e)))?;
 
         Ok(())
     }
 
+    // Methods involving requests to other nodes: Lock scope depends on send_request.
+    // `send_request` itself handles locking internally.
     async fn get_channel_members(
         &mut self,
         app_id: &str,
         channel: &str,
     ) -> Result<HashMap<String, PresenceMemberInfo>> {
-        self.local_adapter
+        let node_count = self.get_node_count().await?; // Fetch node count first
+        let mut horizontal = self.horizontal.lock().await; // Lock for local + remote request
+
+        // Get local members first
+        let mut members = horizontal
+            .local_adapter
             .get_channel_members(app_id, channel)
-            .await
+            .await?;
+
+        // Get distributed members if needed
+        if node_count > 1 {
+            // send_request handles its own locking/timing
+            let response_data = horizontal
+                .send_request(
+                    app_id,
+                    RequestType::ChannelMembers,
+                    Some(channel),
+                    None,
+                    None,
+                    node_count,
+                )
+                .await?;
+            members.extend(response_data.members);
+        }
+
+        Ok(members)
     }
 
+    // Returns only local sockets - inherent limitation
     async fn get_channel_sockets(
         &mut self,
         app_id: &str,
         channel: &str,
     ) -> Result<DashMap<SocketId, Arc<Mutex<WebSocket>>>> {
-        // For channel sockets, we only return local sockets since WebSocket
-        // connections are node-specific
-        self.local_adapter
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
             .get_channel_sockets(app_id, channel)
             .await
     }
 
     async fn get_channel(&mut self, app_id: &str, channel: &str) -> Result<DashSet<SocketId>> {
-        // Similar to get_channel_sockets, we only track local channel subscriptions
-        self.local_adapter.get_channel(app_id, channel).await
+        let node_count = self.get_node_count().await?;
+        let mut horizontal = self.horizontal.lock().await; // Lock for local + remote request
+
+        // Start with local channel data
+        let mut result = horizontal
+            .local_adapter
+            .get_channel(app_id, channel)
+            .await?;
+
+        // Get distributed channels if needed
+        if node_count > 1 {
+            // send_request handles its own locking/timing
+            let response_data = horizontal
+                .send_request(
+                    app_id,
+                    RequestType::ChannelSockets,
+                    Some(channel),
+                    None,
+                    None,
+                    node_count,
+                )
+                .await?;
+
+            // Add remote sockets to the result
+            for socket_id in response_data.socket_ids {
+                result.insert(SocketId(socket_id));
+            }
+        }
+
+        Ok(result)
     }
 
     async fn remove_channel(&mut self, app_id: &str, channel: &str) {
-        // Remove channel locally - other nodes handle their own channel cleanup
-        self.local_adapter.remove_channel(app_id, channel).await
+        // This seems purely local, lock scope depends on local_adapter
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
+            .remove_channel(app_id, channel)
+            .await
     }
 
     async fn is_in_channel(
@@ -268,47 +607,121 @@ impl Adapter for RedisAdapter {
         channel: &str,
         socket_id: &SocketId,
     ) -> Result<bool> {
-        // Check channel membership locally since sockets are node-specific
-        self.local_adapter
+        let node_count = self.get_node_count().await?; // Get count first
+        let mut horizontal = self.horizontal.lock().await; // Lock for local + potential remote
+
+        Log::warning(format!(
+            "Checking if socket {} is in channel {} locally",
+            socket_id, channel
+        ));
+        let local_result = horizontal
+            .local_adapter
             .is_in_channel(app_id, channel, socket_id)
-            .await
+            .await?;
+
+        if local_result {
+            Log::warning_title(format!(
+                "Socket {} found in channel {} locally",
+                socket_id, channel
+            ));
+            return Ok(true);
+        }
+
+        // If not found locally, check other nodes if they exist
+        if node_count > 1 {
+            Log::warning_title(format!(
+                "Checking remote nodes for socket {} in channel {}",
+                socket_id, channel
+            ));
+            // send_request handles its own locking/timing
+            let response_data = horizontal
+                .send_request(
+                    app_id,
+                    RequestType::SocketExistsInChannel,
+                    Some(channel),
+                    Some(&socket_id.0),
+                    None,
+                    node_count,
+                )
+                .await?;
+            Log::warning_title(format!(
+                "Remote check result for socket {} in channel {}: {}",
+                socket_id, channel, response_data.exists
+            ));
+            return Ok(response_data.exists);
+        }
+
+        Log::warning_title(format!(
+            "Socket {} NOT found in channel {} (only local node checked or remote check negative)",
+            socket_id, channel
+        ));
+        Ok(false) // Not found locally, and no other nodes or not found remotely
     }
 
+    // Returns only local sockets - inherent limitation
     async fn get_user_sockets(
         &mut self,
         user_id: &str,
         app_id: &str,
     ) -> Result<DashSet<WebSocketRef>> {
-        // Get user sockets from local node only
-        self.local_adapter.get_user_sockets(user_id, app_id).await
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
+            .get_user_sockets(user_id, app_id)
+            .await
     }
 
     async fn cleanup_connection(&mut self, app_id: &str, ws: WebSocketRef) {
-        // Clean up the connection locally
-        self.local_adapter.cleanup_connection(app_id, ws).await;
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
+            .cleanup_connection(app_id, ws)
+            .await
     }
-
-    async fn terminate_connection(&mut self, app_id: &str, user_id: &str) -> Result<()> {
-        // Terminate connection locally
-        self.local_adapter
-            .terminate_connection(app_id, user_id)
-            .await?;
-        Ok(())
-    }
+    
 
     async fn add_channel_to_sockets(&mut self, app_id: &str, channel: &str, socket_id: &SocketId) {
-        // Add channel to socket mapping locally
-        self.local_adapter
+        // Seems purely local
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
             .add_channel_to_sockets(app_id, channel, socket_id)
             .await
     }
 
     async fn get_channel_socket_count(&mut self, app_id: &str, channel: &str) -> usize {
-        // Get local socket count - for a global count you'd need to implement
-        // a Redis-based counting mechanism
-        self.local_adapter
+        let node_count = self.get_node_count().await.unwrap_or(1); // Get count first
+        let mut horizontal = self.horizontal.lock().await; // Lock for local + potential remote
+
+        // Get local count
+        let local_count = horizontal
+            .local_adapter
             .get_channel_socket_count(app_id, channel)
-            .await
+            .await;
+
+        // Get distributed count if needed
+        if node_count > 1 {
+            // send_request handles its own locking/timing
+            match horizontal
+                .send_request(
+                    app_id,
+                    RequestType::ChannelSocketsCount,
+                    Some(channel),
+                    None,
+                    None,
+                    node_count,
+                )
+                .await
+            {
+                Ok(response_data) => local_count + response_data.sockets_count,
+                Err(e) => {
+                    Log::error(format!("Failed to get remote socket count for channel {}: {}", channel, e));
+                    local_count // Return local count on error
+                }
+            }
+        } else {
+            local_count
+        }
     }
 
     async fn add_to_channel(
@@ -317,8 +730,14 @@ impl Adapter for RedisAdapter {
         channel: &str,
         socket_id: &SocketId,
     ) -> Result<bool> {
-        // Add socket to channel locally
-        self.local_adapter
+        // Seems purely local
+        let mut horizontal = self.horizontal.lock().await;
+        Log::warning_title(format!(
+            "Adding socket {} to channel {}",
+            socket_id, channel
+        ));
+        horizontal
+            .local_adapter
             .add_to_channel(app_id, channel, socket_id)
             .await
     }
@@ -329,8 +748,10 @@ impl Adapter for RedisAdapter {
         channel: &str,
         socket_id: &SocketId,
     ) -> Result<bool> {
-        // Remove socket from channel locally
-        self.local_adapter
+        // Seems purely local
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
             .remove_from_channel(app_id, channel, socket_id)
             .await
     }
@@ -341,28 +762,57 @@ impl Adapter for RedisAdapter {
         channel: &str,
         socket_id: &SocketId,
     ) -> Option<PresenceMemberInfo> {
-        // Get presence member info from local node
-        self.local_adapter
+        // Seems purely local
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal
+            .local_adapter
             .get_presence_member(app_id, channel, socket_id)
             .await
     }
 
+    // Public method using the optimized internal call
     async fn terminate_user_connections(&mut self, app_id: &str, user_id: &str) -> Result<()> {
-        // Terminate user connections locally first
-        self.local_adapter
-            .terminate_user_connections(app_id, user_id)
-            .await?;
-
-        Ok(())
+        self.terminate_connection(app_id, user_id).await
     }
 
     async fn add_user(&mut self, ws: Arc<Mutex<WebSocket>>) -> Result<()> {
-        // Add user to local node
-        self.local_adapter.add_user(ws).await
+        // Seems purely local
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal.local_adapter.add_user(ws).await
     }
 
     async fn remove_user(&mut self, ws: Arc<Mutex<WebSocket>>) -> Result<()> {
-        // Remove user from local node
-        self.local_adapter.remove_user(ws).await
+        // Seems purely local
+        let mut horizontal = self.horizontal.lock().await;
+        horizontal.local_adapter.remove_user(ws).await
+    }
+
+    async fn terminate_connection(&mut self, app_id: &str, user_id: &str) -> Result<()> {
+        let node_count = self.get_node_count().await?; // Get count first
+        let mut horizontal = self.horizontal.lock().await; // Lock for local + potential remote
+
+        // First terminate locally
+        horizontal
+            .local_adapter
+            .terminate_connection(app_id, user_id)
+            .await?; // Propagate local errors
+
+        // Then broadcast to other nodes if needed
+        if node_count > 1 {
+            // send_request handles its own locking/timing
+            // We ignore the result here as it's a "fire and forget" termination broadcast
+            let _ = horizontal
+                .send_request(
+                    app_id,
+                    RequestType::TerminateUserConnections,
+                    None,
+                    None,
+                    Some(user_id),
+                    node_count,
+                )
+                .await;
+        }
+
+        Ok(())
     }
 }

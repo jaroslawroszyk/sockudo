@@ -72,7 +72,7 @@ impl ConnectionHandler {
         }
 
         if let Err(e) = self.send_connection_established(&app.id, &socket_id).await {
-            self.send_error(&app.id, &socket_id, e, None).await.unwrap();
+            self.send_error(&app.id, &socket_id, &e, None).await.unwrap();
             return Ok(());
         }
 
@@ -105,7 +105,9 @@ impl ConnectionHandler {
                         conn.state.update_ping();
                     }
                 }
-                _ => {}
+                _ => {
+                    println!("Unsupported opcode: {:?}", frame.opcode);
+                }
             }
         }
 
@@ -120,6 +122,7 @@ impl ConnectionHandler {
     ) -> crate::error::Result<()> {
         let msg = String::from_utf8(frame.payload.to_vec()).unwrap();
         let message: PusherMessage = serde_json::from_str(&msg)?;
+        println!("Received message: {:?}", message);
 
         // Extract values we need after the match before moving message
         let event = message
@@ -156,7 +159,7 @@ impl ConnectionHandler {
         };
 
         if let Err(e) = result {
-            self.send_error(&app.id, socket_id, e, channel).await?;
+            self.send_error(&app.id, socket_id, &e, channel).await?;
 
             let mut connection_manager = self.connection_manager.lock().await;
             let conn = connection_manager
@@ -168,8 +171,8 @@ impl ConnectionHandler {
                 .await;
 
             return Err(Error::ClientEventError(format!(
-                "Failed to handle event: {}",
-                event
+                "Failed to handle event: {}, error: {}",
+                event, e
             )));
         }
 
@@ -280,7 +283,7 @@ impl ConnectionHandler {
                 .send_error(
                     app_id,
                     socket_id,
-                    Error::AuthError("Invalid authentication signature".into()),
+                    &Error::AuthError("Invalid authentication signature".into()),
                     Some(channel.to_string()),
                 )
                 .await;
@@ -571,7 +574,7 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    pub async fn handle_client_event(
+    async fn handle_client_event(
         &self,
         app_id: &str,
         socket_id: &SocketId,
@@ -618,18 +621,54 @@ impl ConnectionHandler {
             ));
         }
 
-        // Verify channel subscription
-        {
+        // Get the local connection state before checking channel subscription
+        // to understand what channels the client thinks they're subscribed to
+        let subscribed_channels = {
             let mut connection_manager = self.connection_manager.lock().await;
-            if !connection_manager
+            if let Some(connection) = connection_manager.get_connection(socket_id, app_id).await {
+                let conn = connection.lock().await;
+                conn.state.subscribed_channels.clone()
+            } else {
+                HashSet::new()
+            }
+        };
+
+        // Log state for debugging
+        Log::info(format!("Socket {} subscribed channels: {:?}", socket_id, subscribed_channels));
+        Log::info(format!("Checking if socket {} is in channel {}", socket_id, channel_name));
+
+        // Check if the client thinks they're subscribed to this channel
+        if !subscribed_channels.contains(channel_name) {
+            Log::warning(format!(
+                "Socket {} not subscribed to {} in connection state",
+                socket_id, channel_name
+            ));
+        }
+
+        // Verify channel subscription with additional logging
+        let is_subscribed = {
+            let mut connection_manager = self.connection_manager.lock().await;
+            connection_manager
                 .is_in_channel(app_id, channel_name, socket_id)
                 .await?
-            {
-                return Err(Error::ClientEventError(format!(
-                    "Client {} is not subscribed to channel {}",
-                    socket_id, channel_name
-                )));
+        };
+
+        // If not subscribed, log and return error
+        if !is_subscribed {
+            // Check if there's a mismatch in the channel name
+            for subscribed in &subscribed_channels {
+                if subscribed.to_lowercase() == channel_name.to_lowercase() {
+                    Log::warning(format!(
+                        "Case mismatch between subscribed channel {} and requested channel {}",
+                        subscribed, channel_name
+                    ));
+                }
             }
+
+            return Err(Error::ClientEventError(format!(
+                "Client {} is not subscribed to channel {}",
+                socket_id, channel_name
+            )));
         }
 
         // Prepare message for send - only clone strings when constructing the message
@@ -652,7 +691,7 @@ impl ConnectionHandler {
         &self,
         app_id: &str,
         socket_id: &SocketId,
-        error: Error,
+        error: &Error,
         channel: Option<String>,
     ) -> crate::error::Result<()> {
         let error = ErrorData {

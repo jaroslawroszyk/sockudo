@@ -132,6 +132,15 @@ pub enum Error {
 
     #[error("Redis error: {0}")]
     RedisError(String),
+
+    #[error("Request timeout")]
+    RequestTimeout,
+
+    #[error("Own request ignored")]
+    OwnRequestIgnored,
+
+    #[error("Horizontal adapter error: {0}")]
+    HorizontalAdapterError(String),
 }
 
 

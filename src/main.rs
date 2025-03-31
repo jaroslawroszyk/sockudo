@@ -40,7 +40,7 @@ use crate::{
     error::Result,
 };
 use crate::adapter::local_adapter::{LocalAdapter};
-use crate::adapter::redis_adapter::{RedisAdapter};
+use crate::adapter::redis_adapter::{RedisAdapter, RedisAdapterConfig};
 
 // Server state containing all managers
 #[derive(Clone)]
@@ -64,9 +64,16 @@ async fn main() -> Result<()> {
     // Create managers
 
     let app_manager = Arc::new(AppManager::new());
-   
+   let config = RedisAdapterConfig::default();
+    // let mut connection_manager = match RedisAdapter::new(config).await {
+    //     Ok(adapter) => {
+    //         tracing::info!("Using Redis adapter");
+    //         adapter
+    //     },
+    //     Err(_) => todo!()
+    // };
+    // connection_manager.init().await;
     let connection_manager = LocalAdapter::new();
-    // let connection_manager = LocalAdapter::new();
     let connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>> =
         Arc::new(Mutex::new(Box::new(connection_manager)));
 

@@ -41,6 +41,13 @@ impl LocalAdapter {
         }
         self.namespaces.get(app_id).unwrap().clone()
     }
+    pub async fn get_all_connections(&mut self, app_id: &str) -> DashMap<SocketId, Arc<Mutex<WebSocket>>> {
+        // First, get or create the namespace for this app
+        let namespace = self.get_or_create_namespace(app_id).await;
+
+        // Return a clone of the sockets DashMap from the namespace
+        namespace.sockets.clone()
+    }
 }
 
 #[async_trait::async_trait]
