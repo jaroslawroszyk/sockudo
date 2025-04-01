@@ -1,6 +1,6 @@
+use crate::app::config::App;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::app::config::App;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerOptions {

@@ -8,9 +8,8 @@ use fastwebsockets::WebSocketWrite;
 use futures::StreamExt;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
-use redis::{AsyncCommands, AsyncConnectionConfig};
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use redis::cluster::{ClusterClient, ClusterClientBuilder};
+use redis::{AsyncCommands};
 use tokio::io::WriteHalf;
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
@@ -35,43 +34,40 @@ const RESPONSES_SUFFIX: &str = "#responses";
 
 /// Redis adapter configuration
 #[derive(Debug, Clone)]
-pub struct RedisAdapterConfig {
+pub struct RedisClusterAdapterConfig {
     /// Redis URL
-    pub url: String,
+    pub urls: Vec<String>,
     /// Channel prefix
     pub prefix: String,
     /// Request timeout in milliseconds
     pub request_timeout_ms: u64,
     /// Use connection manager for auto-reconnection
     pub use_connection_manager: bool,
-    /// Cluster mode (for Redis Cluster)
-    pub cluster_mode: bool,
 }
 
-impl Default for RedisAdapterConfig {
+impl Default for RedisClusterAdapterConfig {
     fn default() -> Self {
         Self {
-            url: "redis://127.0.0.1:6379/".to_string(),
+            urls: vec![],
             prefix: DEFAULT_PREFIX.to_string(),
             request_timeout_ms: 5000,
             use_connection_manager: true,
-            cluster_mode: false,
         }
     }
 }
 
 /// Redis adapter for horizontal scaling (Optimized Version)
-pub struct RedisAdapter {
+pub struct RedisClusterAdapter {
     /// Base horizontal adapter (protected by a Mutex)
     /// Optimization Note: While the Mutex remains, methods now try to minimize lock duration.
     /// Further optimization would require refactoring HorizontalAdapter internals.
     pub horizontal: Arc<Mutex<HorizontalAdapter>>,
 
     /// Redis client
-    pub client: redis::Client,
+    pub client: redis::cluster::ClusterClient,
 
     /// Redis connection for publishing (Multiplexed for efficiency)
-    pub connection: redis::aio::MultiplexedConnection,
+    pub connection: redis::cluster_async::ClusterConnection,
 
     /// Channel names
     pub prefix: String,
@@ -80,12 +76,12 @@ pub struct RedisAdapter {
     pub response_channel: String,
 
     /// Configuration
-    pub config: RedisAdapterConfig,
+    pub config: RedisClusterAdapterConfig
 }
 
-impl RedisAdapter {
+impl RedisClusterAdapter {
     /// Create a new Redis adapter
-    pub async fn new(config: RedisAdapterConfig) -> Result<Self> {
+    pub async fn new(config: RedisClusterAdapterConfig) -> Result<Self> {
         // Create the base horizontal adapter
         let mut horizontal = HorizontalAdapter::new();
         Log::info(format!("Redis adapter config: {:?}", config));
@@ -94,20 +90,17 @@ impl RedisAdapter {
         horizontal.requests_timeout = config.request_timeout_ms;
 
         // Create Redis client
-        let client = redis::Client::open(&*config.url)
+        let client = ClusterClient::new(config.clone().urls)
             .map_err(|e| Error::RedisError(format!("Failed to create Redis client: {}", e)))?;
 
         // Get connection based on configuration
         let connection = if config.use_connection_manager {
-            client
-                .get_multiplexed_async_connection()
-                .await
-                .map_err(|e| {
-                    Error::RedisError(format!("Failed to create connection manager: {}", e))
-                })?
+            client.get_async_connection().await.map_err(|e| {
+                Error::RedisError(format!("Failed to create connection manager: {}", e))
+            })?
         } else {
             client
-                .get_multiplexed_tokio_connection()
+                .get_async_connection()
                 .await
                 .map_err(|e| Error::RedisError(format!("Failed to connect to Redis: {}", e)))?
         };
@@ -133,9 +126,9 @@ impl RedisAdapter {
     }
 
     /// Create a new Redis adapter with simple configuration
-    pub async fn with_url(redis_url: &str) -> Result<Self> {
-        let config = RedisAdapterConfig {
-            url: redis_url.to_string(),
+    pub async fn with_nodes(redis_urls: Vec<String>) -> Result<Self> {
+        let config = RedisClusterAdapterConfig {
+            urls: redis_urls,
             ..Default::default()
         };
         Self::new(config).await
@@ -157,17 +150,15 @@ impl RedisAdapter {
     }
 
     /// Start traditional PubSub listeners (Optimized with task spawning)
+    /// Start traditional PubSub listeners (Optimized with task spawning)
     async fn start_listeners_pubsub(&self) -> Result<()> {
-        // Create a subscription connection (separate from the multiplexed one)
-        let sub_client = self.client.clone();
-
         // Clone needed values for the async task
-        // Clone Arc for cheap sharing across tasks
         let horizontal_arc = self.horizontal.clone();
         let pub_connection = self.connection.clone();
         let broadcast_channel = self.broadcast_channel.clone();
         let request_channel = self.request_channel.clone();
         let response_channel = self.response_channel.clone();
+        let cluster_urls = self.config.urls.clone();
 
         // Get node_id without holding the lock for the whole setup
         let node_id = {
@@ -175,21 +166,27 @@ impl RedisAdapter {
             horizontal_lock.node_id.clone()
         }; // Lock released
 
+        // Create a separate channel for receiving PubSub messages
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Create a new client with RESP3 protocol for PubSub
+        let sub_client = ClusterClientBuilder::new(cluster_urls)
+            .use_protocol(redis::ProtocolVersion::RESP3)
+            .push_sender(tx)
+            .build().unwrap();
+
         // Spawn the main listener task
         tokio::spawn(async move {
-            // Create a pubsub connection
-            let mut pubsub = match sub_client.get_async_pubsub().await {
-                Ok(pubsub) => pubsub,
+            // Create a connection for PubSub
+            let mut pubsub = match sub_client.get_async_connection().await {
+                Ok(conn) => conn,
                 Err(e) => {
                     Log::error(format!("Failed to get pubsub connection: {}", e));
-                    // Consider adding retry logic or more robust error handling here
                     return;
                 }
             };
 
             // Subscribe to all channels
-            // Using psubscribe for potential pattern matching flexibility if needed later,
-            // but currently checking exact channel names.
             if let Err(e) = pubsub
                 .subscribe(&[&broadcast_channel, &request_channel, &response_channel])
                 .await
@@ -203,142 +200,176 @@ impl RedisAdapter {
                 broadcast_channel, request_channel, response_channel
             ));
 
-            // Listen for messages
-            let mut message_stream = pubsub.on_message();
+            // Process messages from the channel - PushInfo is the message type for RESP3
+            while let Some(push_info) = rx.recv().await {
+                // Extract channel and payload from PushInfo
+                if push_info.kind != redis::PushKind::Message {
+                    continue; // Skip non-message push notifications
+                }
 
-            while let Some(msg) = message_stream.next().await {
-                let channel: String = msg.get_channel_name().to_string();
-                let payload_result: redis::RedisResult<String> = msg.get_payload();
+                // PushInfo.data for messages should be [channel, payload]
+                if push_info.data.len() < 2 {
+                    Log::error(format!("Invalid push message format: {:?}", push_info));
+                    continue;
+                }
 
-                if let Ok(payload) = payload_result {
-                    // --- Optimization: Process each message type in its own task ---
-                    let horizontal_clone = horizontal_arc.clone();
-                    let node_id_clone = node_id.clone();
-                    let pub_connection_clone = pub_connection.clone();
-                    let broadcast_channel_clone = broadcast_channel.clone();
-                    let request_channel_clone = request_channel.clone();
-                    let response_channel_clone = response_channel.clone();
+                let channel = match &push_info.data[0] {
+                    redis::Value::BulkString(bytes) => match String::from_utf8(bytes.clone()) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            Log::error("Failed to parse channel name from bulk string bytes".to_string());
+                            continue;
+                        }
+                    },
+                    redis::Value::SimpleString(s) => s.clone(),
+                    redis::Value::VerbatimString { format: _, text } => text.clone(),
+                    _ => {
+                        Log::error(format!("Unexpected channel format: {:?}", push_info.data[0]));
+                        continue;
+                    }
+                };
 
-                    tokio::spawn(async move {
-                        // Process based on channel name
-                        if channel == broadcast_channel_clone {
-                            // Handle broadcast message
-                            match serde_json::from_str::<BroadcastMessage>(&payload) {
-                                Ok(broadcast) => {
-                                    // Skip our own messages
-                                    if broadcast.node_id == node_id_clone {
-                                        return;
-                                    }
-                                    // Process the broadcast
-                                    match serde_json::from_str(&broadcast.message) {
-                                        Ok(message) => {
-                                            let except_id = broadcast
-                                                .except_socket_id
-                                                .as_ref()
-                                                .map(|id| SocketId(id.clone()));
-                                            // Lock only when interacting with local adapter
-                                            let mut horizontal_lock = horizontal_clone.lock().await;
-                                            let _ = horizontal_lock
-                                                .local_adapter
-                                                .send(
-                                                    &broadcast.channel,
-                                                    message,
-                                                    except_id.as_ref(),
-                                                    &broadcast.app_id,
-                                                )
-                                                .await;
-                                            // Lock released automatically when horizontal_lock goes out of scope
-                                        }
-                                        Err(e) => {
-                                            Log::warning(format!(
-                                                "Failed to deserialize broadcast inner message: {}, Payload: {}",
-                                                e, broadcast.message
-                                            ));
-                                        }
-                                    }
+                let payload = match &push_info.data[1] {
+                    redis::Value::BulkString(bytes) => match String::from_utf8(bytes.clone()) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            Log::error("Failed to parse payload from bulk string bytes".to_string());
+                            continue;
+                        }
+                    },
+                    redis::Value::SimpleString(s) => s.clone(),
+                    redis::Value::VerbatimString { format: _, text } => text.clone(),
+                    _ => {
+                        Log::error(format!("Unexpected payload format: {:?}", push_info.data[1]));
+                        continue;
+                    }
+                };
+
+                // Process the message in a separate task
+                let horizontal_clone = horizontal_arc.clone();
+                let node_id_clone = node_id.clone();
+                let pub_connection_clone = pub_connection.clone();
+                let broadcast_channel_clone = broadcast_channel.clone();
+                let request_channel_clone = request_channel.clone();
+                let response_channel_clone = response_channel.clone();
+
+                tokio::spawn(async move {
+                    // Process based on channel name
+                    if channel == broadcast_channel_clone {
+                        // Handle broadcast message
+                        match serde_json::from_str::<BroadcastMessage>(&payload) {
+                            Ok(broadcast) => {
+                                // Skip our own messages
+                                if broadcast.node_id == node_id_clone {
+                                    return;
                                 }
-                                Err(e) => {
-                                    Log::warning(format!(
-                                        "Failed to deserialize broadcast message: {}, Payload: {}",
-                                        e, payload
-                                    ));
+                                // Process the broadcast
+                                match serde_json::from_str(&broadcast.message) {
+                                    Ok(message) => {
+                                        let except_id = broadcast
+                                            .except_socket_id
+                                            .as_ref()
+                                            .map(|id| SocketId(id.clone()));
+                                        // Lock only when interacting with local adapter
+                                        let mut horizontal_lock = horizontal_clone.lock().await;
+                                        let _ = horizontal_lock
+                                            .local_adapter
+                                            .send(
+                                                &broadcast.channel,
+                                                message,
+                                                except_id.as_ref(),
+                                                &broadcast.app_id,
+                                            )
+                                            .await;
+                                        // Lock released automatically when horizontal_lock goes out of scope
+                                    }
+                                    Err(e) => {
+                                        Log::warning(format!(
+                                            "Failed to deserialize broadcast inner message: {}, Payload: {}",
+                                            e, broadcast.message
+                                        ));
+                                    }
                                 }
                             }
-                        } else if channel == request_channel_clone {
-                            // Handle request message
-                            match serde_json::from_str::<RequestBody>(&payload) {
-                                Ok(request) => {
-                                    // Skip our own requests
-                                    if request.node_id == node_id_clone {
-                                        return;
-                                    }
-                                    // Process the request (already designed to be async)
-                                    // Lock only when processing
-                                    let response = {
-                                        // Scope for the lock
-                                        let mut horizontal_lock = horizontal_clone.lock().await;
-                                        horizontal_lock.process_request(request).await
-                                    }; // Lock released
-                                    if let Ok(response) = response {
-                                        // Send response
-                                        match serde_json::to_string(&response) {
-                                            Ok(response_json) => {
-                                                let mut conn = pub_connection_clone.clone();
-                                                if let Err(e) = conn
-                                                    .publish::<_, _, ()>(
-                                                        &response_channel_clone,
-                                                        response_json,
-                                                    )
-                                                    .await
-                                                {
-                                                    Log::error(format!(
-                                                        "Failed to publish response: {}",
-                                                        e
-                                                    ));
-                                                }
-                                            }
-                                            Err(e) => {
+                            Err(e) => {
+                                Log::warning(format!(
+                                    "Failed to deserialize broadcast message: {}, Payload: {}",
+                                    e, payload
+                                ));
+                            }
+                        }
+                    } else if channel == request_channel_clone {
+                        // Handle request message
+                        match serde_json::from_str::<RequestBody>(&payload) {
+                            Ok(request) => {
+                                // Skip our own requests
+                                if request.node_id == node_id_clone {
+                                    return;
+                                }
+                                // Process the request (already designed to be async)
+                                // Lock only when processing
+                                let response = {
+                                    // Scope for the lock
+                                    let mut horizontal_lock = horizontal_clone.lock().await;
+                                    horizontal_lock.process_request(request).await
+                                }; // Lock released
+                                if let Ok(response) = response {
+                                    // Send response
+                                    match serde_json::to_string(&response) {
+                                        Ok(response_json) => {
+                                            let mut conn = pub_connection_clone.clone();
+                                            if let Err(e) = conn
+                                                .publish::<_, _, ()>(
+                                                    &response_channel_clone,
+                                                    response_json,
+                                                )
+                                                .await
+                                            {
                                                 Log::error(format!(
-                                                    "Failed to serialize response: {}",
+                                                    "Failed to publish response: {}",
                                                     e
                                                 ));
                                             }
                                         }
+                                        Err(e) => {
+                                            Log::error(format!(
+                                                "Failed to serialize response: {}",
+                                                e
+                                            ));
+                                        }
                                     }
-                                }
-                                Err(e) => {
-                                    Log::warning(format!(
-                                        "Failed to deserialize request message: {}, Payload: {}",
-                                        e, payload
-                                    ));
                                 }
                             }
-                        } else if channel == response_channel_clone {
-                            // Handle response message
-                            match serde_json::from_str::<ResponseBody>(&payload) {
-                                Ok(response) => {
-                                    // Skip our own responses
-                                    if response.node_id == node_id_clone {
-                                        return;
-                                    }
-                                    // Process the response (already designed to be async)
-                                    // Lock only when processing
-                                    let mut horizontal_lock = horizontal_clone.lock().await;
-                                    let _ = horizontal_lock.process_response(response).await;
-                                    // Lock released automatically
-                                }
-                                Err(e) => {
-                                    Log::warning(format!(
-                                        "Failed to deserialize response message: {}, Payload: {}",
-                                        e, payload
-                                    ));
-                                }
+                            Err(e) => {
+                                Log::warning(format!(
+                                    "Failed to deserialize request message: {}, Payload: {}",
+                                    e, payload
+                                ));
                             }
                         }
-                    }); // End of spawned task for message processing
-                } else if let Err(e) = payload_result {
-                    Log::error(format!("Failed to get payload from Redis message: {}", e));
-                }
+                    } else if channel == response_channel_clone {
+                        // Handle response message
+                        match serde_json::from_str::<ResponseBody>(&payload) {
+                            Ok(response) => {
+                                // Skip our own responses
+                                if response.node_id == node_id_clone {
+                                    return;
+                                }
+                                // Process the response (already designed to be async)
+                                // Lock only when processing
+                                let mut horizontal_lock = horizontal_clone.lock().await;
+                                let _ = horizontal_lock.process_response(response).await;
+                                // Lock released automatically
+                            }
+                            Err(e) => {
+                                Log::warning(format!(
+                                    "Failed to deserialize response message: {}, Payload: {}",
+                                    e, payload
+                                ));
+                            }
+                        }
+                    }
+                }); // End of spawned task for message processing
             }
             Log::info("Redis Pub/Sub listener stream ended.");
         });
@@ -348,53 +379,43 @@ impl RedisAdapter {
 
     /// Get the number of nodes in the cluster (Optimized parsing)
     pub async fn get_node_count(&self) -> Result<usize> {
-        if self.config.cluster_mode {
-            // TODO: Implement actual Redis Cluster node counting logic
-            // This requires querying CLUSTER NODES and potentially aggregating
-            // PUBSUB NUMSUB results from multiple nodes. It's complex.
-            Log::warning(
-                "Cluster mode node count is not fully implemented, returning placeholder.",
-            );
-            Ok(5) // Placeholder
-        } else {
-            // Use a cloned connection for the command
-            let mut conn = self.connection.clone();
+        // Use a cloned connection for the command
+        let mut conn = self.connection.clone();
 
-            // Use the PUBSUB NUMSUB command directly
-            let result: redis::RedisResult<Vec<redis::Value>> = redis::cmd("PUBSUB")
-                .arg("NUMSUB")
-                .arg(&self.request_channel)
-                .query_async(&mut conn)
-                .await;
+        // Use the PUBSUB NUMSUB command directly
+        let result: redis::RedisResult<Vec<redis::Value>> = redis::cmd("PUBSUB")
+            .arg("NUMSUB")
+            .arg(&self.request_channel)
+            .query_async(&mut conn)
+            .await;
 
-            match result {
-                Ok(values) => {
-                    // PUBSUB NUMSUB returns [channel, count] format for a single channel
-                    // Or [] if channel doesn't exist or has no subscribers (unlikely for request channel)
-                    if values.len() >= 2 {
-                        if let redis::Value::Int(count) = values[1] {
-                            // Ensure at least 1 node (ourselves)
-                            Ok((count as usize).max(1))
-                        } else {
-                            Log::warning(format!(
-                                "Failed to parse PUBSUB NUMSUB count (not an Int): {:?}",
-                                values
-                            ));
-                            Ok(1) // Default to 1 on unexpected format
-                        }
+        match result {
+            Ok(values) => {
+                // PUBSUB NUMSUB returns [channel, count] format for a single channel
+                // Or [] if channel doesn't exist or has no subscribers (unlikely for request channel)
+                if values.len() >= 2 {
+                    if let redis::Value::Int(count) = values[1] {
+                        // Ensure at least 1 node (ourselves)
+                        Ok((count as usize).max(1))
                     } else {
                         Log::warning(format!(
-                            "PUBSUB NUMSUB returned unexpected result format: {:?}",
+                            "Failed to parse PUBSUB NUMSUB count (not an Int): {:?}",
                             values
                         ));
-                        Ok(1) // Default to 1 if format is wrong (e.g., channel not found)
+                        Ok(1) // Default to 1 on unexpected format
                     }
+                } else {
+                    Log::warning(format!(
+                        "PUBSUB NUMSUB returned unexpected result format: {:?}",
+                        values
+                    ));
+                    Ok(1) // Default to 1 if format is wrong (e.g., channel not found)
                 }
-                Err(e) => {
-                    // Log the error but default to 1 node to avoid breaking logic that relies on node count
-                    Log::error(format!("Failed to execute PUBSUB NUMSUB: {}", e));
-                    Ok(1) // Default to 1 node on error
-                }
+            }
+            Err(e) => {
+                // Log the error but default to 1 node to avoid breaking logic that relies on node count
+                Log::error(format!("Failed to execute PUBSUB NUMSUB: {}", e));
+                Ok(1) // Default to 1 node on error
             }
         }
     }
@@ -406,7 +427,7 @@ impl RedisAdapter {
 }
 
 #[async_trait]
-impl Adapter for RedisAdapter {
+impl Adapter for RedisClusterAdapter {
     async fn init(&mut self) {
         // Lock scope minimized
         {

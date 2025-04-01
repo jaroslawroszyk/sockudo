@@ -2,9 +2,9 @@ use super::manager::AppManager;
 use crate::app::config::App;
 use crate::error::Error;
 use crate::token::{secure_compare, Token};
+use crate::websocket::SocketId;
 use serde::Deserialize;
 use std::sync::Arc;
-use crate::websocket::SocketId;
 
 #[derive(Debug, Deserialize)]
 pub struct ChannelAuth {

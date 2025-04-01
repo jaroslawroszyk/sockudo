@@ -1,4 +1,3 @@
-
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -117,16 +116,16 @@ pub enum Error {
     // Generic errors
     #[error("Invalid app key")]
     InvalidAppKey,
-    
+
     #[error("Cache error: {0}")]
     CacheError(String),
-    
+
     #[error("Invalid JSON")]
     SerializationError(String),
-    
+
     #[error("Broadcast error: {0}")]
     BroadcastError(String),
-    
+
     #[error("Other: {0}")]
     Other(String),
 
@@ -142,7 +141,6 @@ pub enum Error {
     #[error("Horizontal adapter error: {0}")]
     HorizontalAdapterError(String),
 }
-
 
 // Add conversion to WebSocket close codes
 impl Error {
@@ -170,7 +168,7 @@ impl Error {
             // 4300-4399: Other errors
             Error::ClientEventRateLimit => 4301,
             Error::WatchlistLimitExceeded => 4302,
-            
+
             Error::BroadcastError(_) => 4303,
 
             // Map other errors to appropriate ranges

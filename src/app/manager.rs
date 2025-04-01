@@ -1,9 +1,9 @@
 use super::config::App;
 use crate::error::Error;
+use crate::websocket::SocketId;
 use dashmap::DashMap;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use crate::websocket::SocketId;
 
 type HmacSha256 = Hmac<Sha256>;
 

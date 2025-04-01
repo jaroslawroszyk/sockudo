@@ -1,7 +1,8 @@
-pub mod handler;
 pub mod adapter;
+pub mod handler;
+mod horizontal_adapter;
 pub mod local_adapter;
 pub mod redis_adapter;
-mod horizontal_adapter;
+mod redis_cluster_adapter;
 
-pub use self::{handler::ConnectionHandler, adapter::Adapter};
+pub use self::{adapter::Adapter, handler::ConnectionHandler};

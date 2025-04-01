@@ -35,13 +35,11 @@ impl CacheFactory {
             CacheDriver::Redis => {
                 let cache_manager = RedisCacheManager::new(RedisCacheConfig::default()).await?;
                 Ok(Arc::new(Mutex::new(Box::new(cache_manager))))
-            },
-            CacheDriver::Memory => {
-                Err(Error::CacheError("Memory cache not implemented yet".to_string()))
-            },
-            CacheDriver::None => {
-                Err(Error::CacheError("No cache driver specified".to_string()))
             }
+            CacheDriver::Memory => Err(Error::CacheError(
+                "Memory cache not implemented yet".to_string(),
+            )),
+            CacheDriver::None => Err(Error::CacheError("No cache driver specified".to_string())),
         }
     }
 

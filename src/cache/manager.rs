@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use crate::error::Result;
+use async_trait::async_trait;
 use std::time::Duration;
 
 // Cache Manager Interface trait
@@ -17,9 +17,8 @@ pub trait CacheManager: Send + Sync {
 
     /// Disconnect the manager's made connections
     async fn disconnect(&self) -> Result<()>;
-    
+
     async fn is_healthy(&self) -> Result<bool> {
         Ok(true)
     }
 }
-

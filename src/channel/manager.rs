@@ -1,17 +1,17 @@
 use super::types::ChannelType;
 use super::PresenceMemberInfo;
-use crate::app::config::App;
 use crate::adapter::Adapter;
+use crate::app::config::App;
 use crate::error::Error;
 use crate::protocol::messages::{MessageData, PusherMessage};
 use crate::token::{secure_compare, Token};
+use crate::websocket::SocketId;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::websocket::SocketId;
 
 #[derive(Debug)]
 struct PresenceData {
@@ -72,10 +72,14 @@ impl ChannelManager {
 
         let mut connection_manager = self.connection_manager.lock().await;
 
-        if connection_manager.is_in_channel(app_id, channel_name, &socket_id).await? {
+        if connection_manager
+            .is_in_channel(app_id, channel_name, &socket_id)
+            .await?
+        {
             let channel = connection_manager
                 .get_channel(app_id, channel_name)
-                .await.unwrap();
+                .await
+                .unwrap();
 
             return Ok(JoinResponse {
                 success: true,
@@ -96,11 +100,15 @@ impl ChannelManager {
         };
 
         // Add socket to channel
-        connection_manager.add_to_channel(app_id, channel_name, &socket_id).await.expect("TODO: panic message");
+        connection_manager
+            .add_to_channel(app_id, channel_name, &socket_id)
+            .await
+            .expect("TODO: panic message");
 
         let total_connections = connection_manager
             .get_channel(app_id, channel_name)
-            .await.unwrap()
+            .await
+            .unwrap()
             .len();
 
         Ok(JoinResponse {
@@ -148,11 +156,14 @@ impl ChannelManager {
 
         let remaining_connections = connection_manager
             .get_channel(app_id, channel_name)
-            .await.unwrap()
+            .await
+            .unwrap()
             .len();
 
         if remaining_connections == 0 {
-            connection_manager.remove_channel(app_id, channel_name).await;
+            connection_manager
+                .remove_channel(app_id, channel_name)
+                .await;
         }
 
         Ok(LeaveResponse {
@@ -246,12 +257,7 @@ impl ChannelManager {
             } => {
                 let channel = channel.unwrap();
                 if ChannelType::from_name(&channel) == ChannelType::Presence {
-                    format!(
-                        "{}:{}:{}",
-                        socket_id,
-                        channel,
-                        channel_data.unwrap()
-                    )
+                    format!("{}:{}:{}", socket_id, channel, channel_data.unwrap())
                 } else {
                     format!("{}:{}", socket_id, channel)
                 }

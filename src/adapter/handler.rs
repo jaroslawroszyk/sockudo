@@ -61,18 +61,15 @@ impl ConnectionHandler {
                     .await;
             }
             connection_manager
-                .add_socket(
-                    socket_id.clone(),
-                    socket_tx,
-                    &app.id,
-                    &self.app_manager,
-                )
+                .add_socket(socket_id.clone(), socket_tx, &app.id, &self.app_manager)
                 .await
                 .expect("TODO: panic message");
         }
 
         if let Err(e) = self.send_connection_established(&app.id, &socket_id).await {
-            self.send_error(&app.id, &socket_id, &e, None).await.unwrap();
+            self.send_error(&app.id, &socket_id, &e, None)
+                .await
+                .unwrap();
             return Ok(());
         }
 
@@ -539,7 +536,9 @@ impl ConnectionHandler {
             conn.state.user = Some(user_info.clone());
 
             // Take the socket safely using Option::take
-            let socket = conn.socket.take()
+            let socket = conn
+                .socket
+                .take()
                 .ok_or_else(|| Error::ConnectionError("Socket not found".into()))?;
 
             drop(conn);
@@ -634,8 +633,14 @@ impl ConnectionHandler {
         };
 
         // Log state for debugging
-        Log::info(format!("Socket {} subscribed channels: {:?}", socket_id, subscribed_channels));
-        Log::info(format!("Checking if socket {} is in channel {}", socket_id, channel_name));
+        Log::info(format!(
+            "Socket {} subscribed channels: {:?}",
+            socket_id, subscribed_channels
+        ));
+        Log::info(format!(
+            "Checking if socket {} is in channel {}",
+            socket_id, channel_name
+        ));
 
         // Check if the client thinks they're subscribed to this channel
         if !subscribed_channels.contains(channel_name) {

@@ -1,19 +1,19 @@
-use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::adapter::local_adapter::LocalAdapter;
+use crate::adapter::Adapter;
+use crate::channel::PresenceMemberInfo;
+use crate::error::{Error, Result};
+use crate::log::Log;
+use crate::websocket::SocketId;
 use async_trait::async_trait;
 use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use uuid::Uuid;
-use crate::adapter::Adapter;
-use crate::adapter::local_adapter::LocalAdapter;
-use crate::channel::PresenceMemberInfo;
-use crate::error::{Error, Result};
-use crate::log::Log;
-use crate::websocket::SocketId;
 
 /// Request types for horizontal communication
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,7 +127,10 @@ impl HorizontalAdapter {
 
     /// Process a received request from another node
     pub async fn process_request(&mut self, request: RequestBody) -> Result<ResponseBody> {
-        Log::info(format!("Processing request from node {}: {:?}", request.node_id, request.request_type));
+        Log::info(format!(
+            "Processing request from node {}: {:?}",
+            request.node_id, request.request_type
+        ));
 
         // Skip processing our own requests
         if request.node_id == self.node_id {
@@ -150,42 +153,55 @@ impl HorizontalAdapter {
             RequestType::ChannelMembers => {
                 if let Some(channel) = &request.channel {
                     // Get channel members from local adapter
-                    let members = self.local_adapter.get_channel_members(&request.app_id, channel).await?;
+                    let members = self
+                        .local_adapter
+                        .get_channel_members(&request.app_id, channel)
+                        .await?;
                     response.members = members;
                 }
-            },
+            }
             RequestType::ChannelSockets => {
                 if let Some(channel) = &request.channel {
                     // Get channel sockets from local adapter
-                    let channel = self.local_adapter.get_channel(&request.app_id, channel).await?;
-                    response.socket_ids = channel.iter()
+                    let channel = self
+                        .local_adapter
+                        .get_channel(&request.app_id, channel)
+                        .await?;
+                    response.socket_ids = channel
+                        .iter()
                         .map(|socket_id| socket_id.0.clone())
                         .collect();
                 }
-            },
+            }
             RequestType::ChannelSocketsCount => {
                 if let Some(channel) = &request.channel {
                     // Get channel socket count from local adapter
-                    response.sockets_count = self.local_adapter
-                        .get_channel_socket_count(&request.app_id, channel).await;
+                    response.sockets_count = self
+                        .local_adapter
+                        .get_channel_socket_count(&request.app_id, channel)
+                        .await;
                 }
-            },
+            }
             RequestType::SocketExistsInChannel => {
                 if let (Some(channel), Some(socket_id)) = (&request.channel, &request.socket_id) {
                     // Check if socket exists in channel
                     let socket_id = SocketId(socket_id.clone());
-                    response.exists = self.local_adapter
-                        .is_in_channel(&request.app_id, channel, &socket_id).await?;
+                    response.exists = self
+                        .local_adapter
+                        .is_in_channel(&request.app_id, channel, &socket_id)
+                        .await?;
                 }
-            },
+            }
             RequestType::TerminateUserConnections => {
                 if let Some(user_id) = &request.user_id {
                     // Terminate user connections locally
-                    let _ = self.local_adapter
-                        .terminate_user_connections(&request.app_id, user_id).await;
+                    let _ = self
+                        .local_adapter
+                        .terminate_user_connections(&request.app_id, user_id)
+                        .await;
                     response.exists = true;
                 }
-            },
+            }
         }
 
         // Return the response
@@ -228,11 +244,14 @@ impl HorizontalAdapter {
         };
 
         // Add to pending requests
-        self.pending_requests.insert(request_id.clone(), PendingRequest {
-            start_time: Instant::now(),
-            app_id: app_id.to_string(),
-            responses: Vec::new(),
-        });
+        self.pending_requests.insert(
+            request_id.clone(),
+            PendingRequest {
+                start_time: Instant::now(),
+                app_id: app_id.to_string(),
+                responses: Vec::new(),
+            },
+        );
 
         // Serialize the request
         let request_json = serde_json::to_string(&request)?;
@@ -245,7 +264,11 @@ impl HorizontalAdapter {
         let start = Instant::now();
 
         // Maximum nodes to wait for (don't wait for more than expected_node_count)
-        let max_nodes = if expected_node_count > 1 { expected_node_count - 1 } else { 0 };
+        let max_nodes = if expected_node_count > 1 {
+            expected_node_count - 1
+        } else {
+            0
+        };
 
         // Combine the results
         let mut combined_response = ResponseBody {

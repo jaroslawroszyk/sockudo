@@ -36,7 +36,7 @@ async-trait = "0.1.83"
 anyhow = "1.0.94"
 apalis-redis = "0.7.0"
 apalis = { version = "0.7.0", features = ["limit", "retry"] }
-redis = { version = "0.28.1", features = ["tokio-comp", "json"] }
+redis = { version = "0.28.1", features = ["tokio-comp", "json", "cluster", "cluster-async"] }
 rayon = "1.10.0"
 log = "0.4.22"
 
