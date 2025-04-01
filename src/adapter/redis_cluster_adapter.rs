@@ -36,7 +36,7 @@ const RESPONSES_SUFFIX: &str = "#responses";
 #[derive(Debug, Clone)]
 pub struct RedisClusterAdapterConfig {
     /// Redis URL
-    pub urls: Vec<String>,
+    pub nodes: Vec<String>,
     /// Channel prefix
     pub prefix: String,
     /// Request timeout in milliseconds
@@ -48,7 +48,7 @@ pub struct RedisClusterAdapterConfig {
 impl Default for RedisClusterAdapterConfig {
     fn default() -> Self {
         Self {
-            urls: vec![],
+            nodes: vec![],
             prefix: DEFAULT_PREFIX.to_string(),
             request_timeout_ms: 5000,
             use_connection_manager: true,
@@ -90,7 +90,7 @@ impl RedisClusterAdapter {
         horizontal.requests_timeout = config.request_timeout_ms;
 
         // Create Redis client
-        let client = ClusterClient::new(config.clone().urls)
+        let client = ClusterClient::new(config.nodes.clone())
             .map_err(|e| Error::RedisError(format!("Failed to create Redis client: {}", e)))?;
 
         // Get connection based on configuration
@@ -126,9 +126,9 @@ impl RedisClusterAdapter {
     }
 
     /// Create a new Redis adapter with simple configuration
-    pub async fn with_nodes(redis_urls: Vec<String>) -> Result<Self> {
+    pub async fn with_nodes(nodes: Vec<String>) -> Result<Self> {
         let config = RedisClusterAdapterConfig {
-            urls: redis_urls,
+            nodes,
             ..Default::default()
         };
         Self::new(config).await
@@ -158,7 +158,7 @@ impl RedisClusterAdapter {
         let broadcast_channel = self.broadcast_channel.clone();
         let request_channel = self.request_channel.clone();
         let response_channel = self.response_channel.clone();
-        let cluster_urls = self.config.urls.clone();
+        let nodes = self.config.nodes.clone();
 
         // Get node_id without holding the lock for the whole setup
         let node_id = {
@@ -170,7 +170,7 @@ impl RedisClusterAdapter {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
         // Create a new client with RESP3 protocol for PubSub
-        let sub_client = ClusterClientBuilder::new(cluster_urls)
+        let sub_client = ClusterClientBuilder::new(nodes)
             .use_protocol(redis::ProtocolVersion::RESP3)
             .push_sender(tx)
             .build().unwrap();
