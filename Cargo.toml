@@ -39,8 +39,7 @@ apalis = { version = "0.7.0", features = ["limit", "retry"] }
 redis = { version = "0.28.1", features = ["tokio-comp", "json", "cluster", "cluster-async"] }
 rayon = "1.10.0"
 log = "0.4.22"
-
-
+rusty-sidekiq = { version = "0.11.0", default-features = false, optional = true }
 
 
 [dependencies.uuid]

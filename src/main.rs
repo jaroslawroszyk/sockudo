@@ -8,7 +8,6 @@ pub mod log;
 mod namespace;
 mod options;
 mod protocol;
-pub mod queue;
 mod token;
 mod websocket;
 mod ws_handler;
@@ -34,7 +33,6 @@ use crate::app::auth::AuthValidator;
 use crate::app::config::App;
 use crate::app::manager::AppManager;
 use crate::http_handler::{batch_events, channel, events, terminate_user_connections, usage};
-use crate::queue::queue::{ClientEventData, JobData, JobPayload};
 use crate::ws_handler::handle_ws_upgrade;
 use crate::{
     adapter::{Adapter, ConnectionHandler},

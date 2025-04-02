@@ -7,8 +7,14 @@ use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
+struct CacheConfig {
+    enabled: bool,
+    ttl: usize
+}
+
 pub struct AppManager {
     apps: DashMap<String, App>,
+    cache: CacheConfig,
     // channel_managers: DashMap<String, Arc<RwLock<ChannelManager>>>,
 }
 
@@ -22,6 +28,7 @@ impl AppManager {
     pub fn new() -> Self {
         Self {
             apps: DashMap::new(),
+            cache: CacheConfig { enabled: true, ttl: 1000 },
         }
     }
 
