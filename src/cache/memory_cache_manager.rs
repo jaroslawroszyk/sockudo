@@ -1,10 +1,10 @@
 use crate::cache::manager::CacheManager;
 use crate::error::{Error, Result};
 use async_trait::async_trait;
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
@@ -28,7 +28,7 @@ impl Default for MemoryCacheConfig {
             prefix: "memory_cache".to_string(),
             response_timeout: Some(Duration::from_secs(5)),
             default_ttl: Some(Duration::from_secs(3600)), // 1 hour default
-            cleanup_interval_ms: 1000, // Default to cleanup every second
+            cleanup_interval_ms: 1000,                    // Default to cleanup every second
         }
     }
 }
@@ -98,14 +98,14 @@ impl MemoryCacheManager {
                     _ = cleanup_interval.tick() => {
                         // Perform cleanup
                         let now = Instant::now();
-                        
+
                         // Collect keys to remove
                         let expired_keys: Vec<String> = cache
                             .iter()
                             .filter_map(|entry| {
                                 let key = entry.key().clone();
                                 let value = entry.value();
-                                
+
                                 // Check if the entry is expired
                                 if value.expiration.map_or(false, |exp| exp <= now) {
                                     Some(key)
@@ -114,7 +114,7 @@ impl MemoryCacheManager {
                                 }
                             })
                             .collect();
-                        
+
                         // Remove expired keys
                         for key in expired_keys {
                             cache.remove(&key);
@@ -141,7 +141,8 @@ impl MemoryCacheManager {
         let now = Instant::now();
 
         // Collect keys to remove
-        let expired_keys: Vec<String> = self.cache
+        let expired_keys: Vec<String> = self
+            .cache
             .iter()
             .filter_map(|entry| {
                 let key = entry.key().clone();
@@ -207,10 +208,13 @@ impl CacheManager for MemoryCacheManager {
         };
 
         // Insert or update entry
-        self.cache.insert(prefixed_key, CacheEntry {
-            value: value.to_string(),
-            expiration,
-        });
+        self.cache.insert(
+            prefixed_key,
+            CacheEntry {
+                value: value.to_string(),
+                expiration,
+            },
+        );
 
         Ok(())
     }
@@ -260,10 +264,11 @@ impl MemoryCacheManager {
     /// Get multiple keys at once
     pub async fn get_many(&mut self, keys: &[&str]) -> Result<Vec<Option<String>>> {
         let now = Instant::now();
-        let results = keys.iter().map(|&key| {
-            let prefixed_key = self.prefixed_key(key);
-            self.cache.get(&prefixed_key)
-                .and_then(|entry| {
+        let results = keys
+            .iter()
+            .map(|&key| {
+                let prefixed_key = self.prefixed_key(key);
+                self.cache.get(&prefixed_key).and_then(|entry| {
                     // Check if not expired
                     if entry.expiration.map_or(true, |exp| exp > now) {
                         Some(entry.value.clone())
@@ -273,7 +278,8 @@ impl MemoryCacheManager {
                         None
                     }
                 })
-        }).collect();
+            })
+            .collect();
 
         Ok(results)
     }
@@ -292,10 +298,13 @@ impl MemoryCacheManager {
         // Insert or update entries
         for (key, value) in pairs {
             let prefixed_key = self.prefixed_key(key);
-            self.cache.insert(prefixed_key, CacheEntry {
-                value: value.to_string(),
-                expiration,
-            });
+            self.cache.insert(
+                prefixed_key,
+                CacheEntry {
+                    value: value.to_string(),
+                    expiration,
+                },
+            );
         }
 
         Ok(())
@@ -307,7 +316,8 @@ impl MemoryCacheManager {
         let prefix_str = format!("{}:", self.config.prefix);
 
         // Count entries with the prefix
-        let removed_count = self.cache
+        let removed_count = self
+            .cache
             .iter()
             .filter(|entry| entry.key().starts_with(&prefix_str))
             .count();
@@ -321,7 +331,9 @@ impl MemoryCacheManager {
     /// Get the remaining TTL for a key in seconds
     pub async fn ttl(&mut self, key: &str) -> Result<i64> {
         let prefixed_key = self.prefixed_key(key);
-        let remaining_ttl = self.cache.get(&prefixed_key)
+        let remaining_ttl = self
+            .cache
+            .get(&prefixed_key)
             .and_then(|entry| entry.expiration)
             .map(|exp| {
                 let now = Instant::now();

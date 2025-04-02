@@ -1,6 +1,7 @@
 use crate::adapter::ConnectionHandler;
 use crate::log::Log;
 use crate::protocol::messages::PusherApiMessage;
+use crate::utils;
 use crate::websocket::SocketId;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -82,7 +83,7 @@ pub async fn events(
         channel,
         socket_id,
     } = event.clone();
-    let app = handler.app_manager.get_app(app_id.as_str());
+    let app = handler.app_manager.get_app(app_id.as_str()).await.unwrap();
     if app.is_none() {
         return (
             StatusCode::NOT_FOUND,
@@ -99,6 +100,16 @@ pub async fn events(
                 handler
                     .send_message(&app_id, socket_id.as_ref(), event.clone(), channel.as_str())
                     .await;
+                if utils::is_cache_channel(&channel) {
+                    let mut cache_manager = handler.cache_manager.lock().await;
+                    let key = format!("app:{}:channel:{}:cache_miss", app_id, channel);
+                    let value = serde_json::to_string(&json!({
+                       "event": event.name,
+                        "data": event.data,
+                    }))
+                    .unwrap();
+                    cache_manager.set(key.as_str(), value.as_str(), 3600);
+                }
             }
         }
         None => {
@@ -107,9 +118,23 @@ pub async fn events(
                     &app_id,
                     socket_id.as_ref(),
                     event.clone(),
-                    channel.expect("REASON").as_str(),
+                    channel.clone().expect("REASON").as_str(),
                 )
                 .await;
+            if utils::is_cache_channel(&channel.clone().unwrap()) {
+                let mut cache_manager = handler.cache_manager.lock().await;
+                let key = format!(
+                    "app:{}:channel:{}:cache_miss",
+                    app_id,
+                    channel.clone().unwrap()
+                );
+                let value = serde_json::to_string(&json!({
+                   "event": event.name,
+                    "data": event.data,
+                }))
+                .unwrap();
+                cache_manager.set(key.as_str(), value.as_str(), 3600);
+            }
         }
     }
     (StatusCode::OK, Json(json!({"ok": "true"}))).into_response()
@@ -152,6 +177,16 @@ pub async fn batch_events(
                     channel.as_str(),
                 )
                 .await;
+            if utils::is_cache_channel(&channel.clone()) {
+                let mut cache_manager = handler.cache_manager.lock().await;
+                let key = format!("app:{}:channel:{}:cache_miss", app_id, channel.clone());
+                let value = serde_json::to_string(&json!({
+                   "event": message.name,
+                    "data": message.data,
+                }))
+                .unwrap();
+                cache_manager.set(key.as_str(), value.as_str(), 3600).await;
+            }
         }
     }
     (

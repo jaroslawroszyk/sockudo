@@ -26,7 +26,7 @@ pub trait Adapter: Send + Sync {
         socket_id: SocketId,
         socket: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
         app_id: &str,
-        app_manager: &AppManager,
+        app_manager: &Arc<dyn AppManager + Send + Sync>,
     ) -> Result<()>;
 
     async fn get_connection(

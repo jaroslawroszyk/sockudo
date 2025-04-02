@@ -15,7 +15,7 @@ pub struct ChannelAuth {
 }
 
 pub struct AuthValidator {
-    app_manager: Arc<AppManager>,
+    app_manager: Arc<dyn AppManager>,
 }
 
 #[derive(Debug)]
@@ -25,8 +25,8 @@ pub struct AuthValidationResult {
 }
 
 impl AuthValidator {
-    pub fn new(app_manager: Arc<AppManager>) -> Self {
-        Self { app_manager }
+    pub fn new(app_manager: Arc<dyn AppManager>) -> Self {
+        AuthValidator { app_manager }
     }
 
     pub async fn validate_channel_auth(
@@ -36,9 +36,12 @@ impl AuthValidator {
         user_data: &str,
         auth: &str,
     ) -> Result<bool, Error> {
-        let app = self.app_manager.get_app(app_key).ok_or(Error::InvalidKey)?;
+        let app = self.app_manager.get_app(app_key).await.unwrap();
+        if app.is_none() {
+            return Err(Error::InvalidAppKey);
+        }
         let is_valid =
-            self.sign_in_token_is_valid(socket_id.0.as_str(), user_data, auth, app.clone());
+            self.sign_in_token_is_valid(socket_id.0.as_str(), user_data, auth, app.unwrap());
         Ok(is_valid)
     }
 

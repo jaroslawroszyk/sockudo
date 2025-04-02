@@ -9,7 +9,7 @@ use futures::StreamExt;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use redis::cluster::{ClusterClient, ClusterClientBuilder};
-use redis::{AsyncCommands};
+use redis::AsyncCommands;
 use tokio::io::WriteHalf;
 use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
@@ -76,7 +76,7 @@ pub struct RedisClusterAdapter {
     pub response_channel: String,
 
     /// Configuration
-    pub config: RedisClusterAdapterConfig
+    pub config: RedisClusterAdapterConfig,
 }
 
 impl RedisClusterAdapter {
@@ -173,7 +173,8 @@ impl RedisClusterAdapter {
         let sub_client = ClusterClientBuilder::new(nodes)
             .use_protocol(redis::ProtocolVersion::RESP3)
             .push_sender(tx)
-            .build().unwrap();
+            .build()
+            .unwrap();
 
         // Spawn the main listener task
         tokio::spawn(async move {
@@ -217,14 +218,19 @@ impl RedisClusterAdapter {
                     redis::Value::BulkString(bytes) => match String::from_utf8(bytes.clone()) {
                         Ok(s) => s,
                         Err(_) => {
-                            Log::error("Failed to parse channel name from bulk string bytes".to_string());
+                            Log::error(
+                                "Failed to parse channel name from bulk string bytes".to_string(),
+                            );
                             continue;
                         }
                     },
                     redis::Value::SimpleString(s) => s.clone(),
                     redis::Value::VerbatimString { format: _, text } => text.clone(),
                     _ => {
-                        Log::error(format!("Unexpected channel format: {:?}", push_info.data[0]));
+                        Log::error(format!(
+                            "Unexpected channel format: {:?}",
+                            push_info.data[0]
+                        ));
                         continue;
                     }
                 };
@@ -233,14 +239,19 @@ impl RedisClusterAdapter {
                     redis::Value::BulkString(bytes) => match String::from_utf8(bytes.clone()) {
                         Ok(s) => s,
                         Err(_) => {
-                            Log::error("Failed to parse payload from bulk string bytes".to_string());
+                            Log::error(
+                                "Failed to parse payload from bulk string bytes".to_string(),
+                            );
                             continue;
                         }
                     },
                     redis::Value::SimpleString(s) => s.clone(),
                     redis::Value::VerbatimString { format: _, text } => text.clone(),
                     _ => {
-                        Log::error(format!("Unexpected payload format: {:?}", push_info.data[1]));
+                        Log::error(format!(
+                            "Unexpected payload format: {:?}",
+                            push_info.data[1]
+                        ));
                         continue;
                     }
                 };
@@ -451,7 +462,7 @@ impl Adapter for RedisClusterAdapter {
         socket_id: SocketId,
         socket: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
         app_id: &str,
-        app_manager: &AppManager,
+        app_manager: &Arc<dyn AppManager + Send + Sync>
     ) -> Result<()> {
         let mut horizontal = self.horizontal.lock().await;
         horizontal

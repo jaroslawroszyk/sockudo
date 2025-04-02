@@ -430,7 +430,7 @@ impl Adapter for RedisAdapter {
         socket_id: SocketId,
         socket: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
         app_id: &str,
-        app_manager: &AppManager,
+        app_manager: &Arc<dyn AppManager + Send + Sync>,
     ) -> Result<()> {
         let mut horizontal = self.horizontal.lock().await;
         horizontal

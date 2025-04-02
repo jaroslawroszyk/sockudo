@@ -9,6 +9,7 @@ mod namespace;
 mod options;
 mod protocol;
 mod token;
+pub mod utils;
 mod websocket;
 mod ws_handler;
 
@@ -32,6 +33,9 @@ use crate::adapter::redis_adapter::{RedisAdapter, RedisAdapterConfig};
 use crate::app::auth::AuthValidator;
 use crate::app::config::App;
 use crate::app::manager::AppManager;
+use crate::app::memory_app_manager::MemoryAppManager;
+use crate::cache::manager::CacheManager;
+use crate::cache::redis_cache_manager::{RedisCacheConfig, RedisCacheManager};
 use crate::http_handler::{batch_events, channel, events, terminate_user_connections, usage};
 use crate::ws_handler::handle_ws_upgrade;
 use crate::{
@@ -43,10 +47,11 @@ use crate::{
 // Server state containing all managers
 #[derive(Clone)]
 struct ServerState {
-    app_manager: Arc<AppManager>,
+    app_manager: Arc<dyn AppManager>,
     channel_manager: Arc<RwLock<ChannelManager>>,
     connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>>,
     auth_validator: Arc<AuthValidator>,
+    cache_manager: Arc<Mutex<dyn CacheManager + Send + Sync>>,
 }
 
 #[tokio::main]
@@ -61,15 +66,18 @@ async fn main() -> Result<()> {
 
     // Create managers
 
-    let app_manager = Arc::new(AppManager::new());
+    let app_manager = Arc::new(MemoryAppManager::new());
     let config = RedisAdapterConfig::default();
-    let mut connection_manager = match RedisAdapter::new(config).await {
+    let mut connection_manager = match RedisAdapter::new(config.clone()).await {
         Ok(adapter) => {
             tracing::info!("Using Redis adapter");
             adapter
         }
         Err(_) => todo!(),
     };
+    let cache_manager = RedisCacheManager::new(RedisCacheConfig::default())
+        .await
+        .unwrap();
     connection_manager.init().await;
     // let connection_manager = LocalAdapter::new();
     let connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>> =
@@ -95,6 +103,7 @@ async fn main() -> Result<()> {
         channel_manager,
         connection_manager,
         auth_validator,
+        cache_manager: Arc::new(Mutex::new(cache_manager)),
     };
 
     // Create adapter handler
@@ -102,6 +111,7 @@ async fn main() -> Result<()> {
         state.app_manager.clone(),
         state.channel_manager.clone(),
         state.connection_manager.clone(),
+        state.cache_manager.clone(),
     ));
 
     // Setup CORS

@@ -40,7 +40,7 @@ impl Namespace {
         &self,
         socket_id: SocketId,
         socket: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
-        app_manager: &AppManager,
+        app_manager: &Arc<dyn AppManager + Send + Sync>
     ) {
         // Create channel for message passing
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -51,11 +51,19 @@ impl Namespace {
             socket: Some(socket),
             message_sender: tx,
         };
-
-        // Set app state
-        if let Some(app) = app_manager.get_app(&self.app_id) {
-            connection.state.app = Some(app);
+        match app_manager.get_app(&self.app_id).await {
+            Ok(app) => {
+                if app.is_none() {
+                    Log::error(format!("App not found for app_id: {}", self.app_id));
+                    return;
+                }
+                connection.state.app = app;
+            }
+            Err(e) => {
+                Log::error(format!("Failed to get app: {}", e));
+            }
         }
+        // Set app state
 
         // Wrap connection in Arc<Mutex>
         let connection = Arc::new(Mutex::new(connection));

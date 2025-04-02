@@ -51,16 +51,15 @@ impl RedisClusterCacheManager {
             builder = builder.response_timeout(timeout)
         }
 
-
         // Configure builder with read from replicas if enabled
         if config.read_from_replicas {
             builder = builder.read_from_replicas();
         }
 
         // Build the cluster client
-        let client = builder
-            .build()
-            .map_err(|e| Error::CacheError(format!("Failed to create Redis Cluster client: {}", e)))?;
+        let client = builder.build().map_err(|e| {
+            Error::CacheError(format!("Failed to create Redis Cluster client: {}", e))
+        })?;
 
         // Get cluster connection
         let mut connection = client
@@ -96,7 +95,8 @@ impl RedisClusterCacheManager {
 impl CacheManager for RedisClusterCacheManager {
     /// Check if the given key exists in cache
     async fn has(&mut self, key: &str) -> Result<bool> {
-        let exists: bool = self.connection
+        let exists: bool = self
+            .connection
             .exists(self.prefixed_key(key))
             .await
             .map_err(|e| Error::CacheError(format!("Redis Cluster exists error: {}", e)))?;
@@ -106,7 +106,8 @@ impl CacheManager for RedisClusterCacheManager {
     /// Get a key from the cache
     /// Returns None if cache does not exist
     async fn get(&mut self, key: &str) -> Result<Option<String>> {
-        let value: Option<String> = self.connection
+        let value: Option<String> = self
+            .connection
             .get(self.prefixed_key(key))
             .await
             .map_err(|e| Error::CacheError(format!("Redis Cluster get error: {}", e)))?;
@@ -148,9 +149,8 @@ impl CacheManager for RedisClusterCacheManager {
             Err(_) => return Ok(false),
         };
 
-        let result: redis::RedisResult<String> = redis::cmd("PING")
-            .query_async(&mut connection)
-            .await;
+        let result: redis::RedisResult<String> =
+            redis::cmd("PING").query_async(&mut connection).await;
 
         match result {
             Ok(response) => Ok(response == "PONG"),
@@ -163,7 +163,8 @@ impl CacheManager for RedisClusterCacheManager {
 impl RedisClusterCacheManager {
     /// Delete a key from the cache
     pub async fn delete(&mut self, key: &str) -> Result<bool> {
-        let deleted: i32 = self.connection
+        let deleted: i32 = self
+            .connection
             .del(self.prefixed_key(key))
             .await
             .map_err(|e| Error::CacheError(format!("Redis Cluster delete error: {}", e)))?;
@@ -191,7 +192,8 @@ impl RedisClusterCacheManager {
         // Delete keys one by one to handle cluster slot distribution
         let mut deleted_count = 0;
         for key in keys {
-            let deleted: i32 = self.connection
+            let deleted: i32 = self
+                .connection
                 .del(&key)
                 .await
                 .map_err(|e| Error::CacheError(format!("Redis Cluster delete error: {}", e)))?;
@@ -233,7 +235,8 @@ impl RedisClusterCacheManager {
 
     /// Increment a counter in Redis Cluster
     pub async fn increment(&mut self, key: &str, by: i64) -> Result<i64> {
-        let value: i64 = self.connection
+        let value: i64 = self
+            .connection
             .incr(self.prefixed_key(key), by)
             .await
             .map_err(|e| Error::CacheError(format!("Redis Cluster increment error: {}", e)))?;
@@ -242,7 +245,8 @@ impl RedisClusterCacheManager {
 
     /// Get the remaining TTL for a key in seconds
     pub async fn ttl(&mut self, key: &str) -> Result<i64> {
-        let ttl: i64 = self.connection
+        let ttl: i64 = self
+            .connection
             .ttl(self.prefixed_key(key))
             .await
             .map_err(|e| Error::CacheError(format!("Redis Cluster TTL error: {}", e)))?;
@@ -258,7 +262,8 @@ impl RedisClusterCacheManager {
         // In Redis Cluster, MGET might span multiple slots, so we handle each key individually
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
-            let value: Option<String> = self.connection
+            let value: Option<String> = self
+                .connection
                 .get(self.prefixed_key(key))
                 .await
                 .map_err(|e| Error::CacheError(format!("Redis Cluster get error: {}", e)))?;
@@ -275,10 +280,9 @@ impl RedisClusterCacheManager {
 
     /// Get a new connection to the cluster
     pub async fn get_connection(&self) -> Result<ClusterConnection> {
-        self.client
-            .get_async_connection()
-            .await
-            .map_err(|e| Error::CacheError(format!("Failed to get Redis Cluster connection: {}", e)))
+        self.client.get_async_connection().await.map_err(|e| {
+            Error::CacheError(format!("Failed to get Redis Cluster connection: {}", e))
+        })
     }
 
     /// Get cluster info
