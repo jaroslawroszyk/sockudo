@@ -4,7 +4,7 @@ use crate::protocol::messages::PusherApiMessage;
 use crate::utils;
 use crate::websocket::SocketId;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -108,7 +108,7 @@ pub async fn events(
                         "data": event.data,
                     }))
                     .unwrap();
-                    cache_manager.set(key.as_str(), value.as_str(), 3600);
+                    cache_manager.set(key.as_str(), value.as_str(), 3600).await;
                 }
             }
         }
@@ -133,7 +133,7 @@ pub async fn events(
                     "data": event.data,
                 }))
                 .unwrap();
-                cache_manager.set(key.as_str(), value.as_str(), 3600);
+                cache_manager.set(key.as_str(), value.as_str(), 3600).await;
             }
         }
     }
@@ -206,4 +206,30 @@ pub async fn channel(
         .channel(app_id.as_str(), channel_name.as_str())
         .await;
     (StatusCode::OK, Json(response)).into_response()
+}
+
+pub async fn up(
+    Path(app_id): Path<String>,
+    State(handler): State<Arc<ConnectionHandler>>,
+) -> impl IntoResponse {
+     let _ = match handler.metrics.clone() {
+        Some(metrics_data) => {
+            Log::info("Metrics endpoint");
+            let metrics_data = metrics_data.lock().await;
+            metrics_data.mark_new_connection(&*app_id, &SocketId::new());
+        },
+        None => {
+            return axum::response::Response::builder()
+                .status(200)
+                .header("X-Custom-Foo", "Bar")
+                .body("No metrics available".to_string())
+                .unwrap();
+        }
+    };
+    
+    Response::builder()
+        .status(200)
+        .header("X-Custom-Foo", "Bar")
+        .body("OK".to_string())
+        .unwrap()
 }

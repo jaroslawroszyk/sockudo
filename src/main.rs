@@ -8,13 +8,16 @@ pub mod log;
 mod namespace;
 mod options;
 mod protocol;
+mod rate_limiter;
 mod token;
 pub mod utils;
 mod websocket;
 mod ws_handler;
+mod metrics;
 
+use std::collections::HashMap;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::routing::post;
 use axum::{
     extract::{Path, Query, State},
@@ -24,6 +27,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use aws_sdk_dynamodb::types::KeyType::Hash;
+use axum::response::Response;
+use tokio::io::join;
+use tokio::join;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -36,13 +43,16 @@ use crate::app::manager::AppManager;
 use crate::app::memory_app_manager::MemoryAppManager;
 use crate::cache::manager::CacheManager;
 use crate::cache::redis_cache_manager::{RedisCacheConfig, RedisCacheManager};
-use crate::http_handler::{batch_events, channel, events, terminate_user_connections, usage};
+use crate::http_handler::{batch_events, channel, events, terminate_user_connections, up, usage};
 use crate::ws_handler::handle_ws_upgrade;
 use crate::{
     adapter::{Adapter, ConnectionHandler},
     channel::ChannelManager,
     error::Result,
 };
+use rate_limiter::{create_rate_limiter, middleware as rate_limit_middleware, RateLimitConfig};
+use crate::log::Log;
+use crate::metrics::{MetricsFactory, MetricsInterface, PrometheusMetricsDriver};
 
 // Server state containing all managers
 #[derive(Clone)]
@@ -52,6 +62,7 @@ struct ServerState {
     connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>>,
     auth_validator: Arc<AuthValidator>,
     cache_manager: Arc<Mutex<dyn CacheManager + Send + Sync>>,
+    metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>,
 }
 
 #[tokio::main]
@@ -96,6 +107,8 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     app_manager.register_app(demo_app);
+    let metrics_driver = PrometheusMetricsDriver::new(9601, Some("sockudo")).await;
+    let metrics_driver = Arc::new(Mutex::new(metrics_driver));
 
     // Create server state
     let state = ServerState {
@@ -104,6 +117,7 @@ async fn main() -> Result<()> {
         connection_manager,
         auth_validator,
         cache_manager: Arc::new(Mutex::new(cache_manager)),
+        metrics: Some(metrics_driver.clone()),
     };
 
     // Create adapter handler
@@ -112,6 +126,7 @@ async fn main() -> Result<()> {
         state.channel_manager.clone(),
         state.connection_manager.clone(),
         state.cache_manager.clone(),
+        state.metrics.clone(),
     ));
 
     // Setup CORS
@@ -119,30 +134,85 @@ async fn main() -> Result<()> {
         .allow_origin("*".parse::<HeaderValue>().unwrap())
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
+    let api_limiter = Arc::new(rate_limiter::memory_limiter::MemoryRateLimiter::new(
+        60, // 60 requests
+        60, // per minute
+    ));
+
+    // Create a Redis-based rate limiter for WebSocket connections
+    let redis_client =
+        redis::Client::open("redis://127.0.0.1:6379/").expect("Failed to create Redis client");
+
+    let ws_limiter = Arc::new(
+        rate_limiter::redis_limiter::RedisRateLimiter::new(
+            redis_client,
+            "sockudo".to_string(),
+            10, // 10 connections
+            60, // per minute
+        )
+        .await
+        .expect("Failed to create Redis rate limiter"),
+    );
 
     // Create router
-    let app = Router::new()
+    let http_server = Router::new()
         // WebSocket handler for Pusher protocol
         .route("/app/{key}", get(handle_ws_upgrade))
         .route("/apps/{appId}/events", post(events))
         .route("/apps/{appId}/batch_events", post(batch_events))
+        // .route_layer(rate_limit_middleware::with_path_limiter(
+        //     api_limiter.clone(),
+        //     rate_limit_middleware::RateLimitOptions {
+        //         key_prefix: Some("apps_api".to_string()),
+        //         ..Default::default()
+        //     },
+        // ))
         .route("/apps/{app_id}/channels/{channel_name}", get(channel))
         .route(
             "/apps/{app_id}/users/{user_id}/terminate_connections",
             post(terminate_user_connections),
         )
         .route("/usage", get(usage))
+        .route("/up/{app_id}", get(up))
+        // .route_layer(rate_limit_middleware::with_ip_limiter(
+        //     api_limiter.clone(),
+        //     rate_limit_middleware::RateLimitOptions {
+        //         include_headers: true,
+        //         fail_open: true,
+        //         key_prefix: Some("api".to_string()),
+        //     },
+        // ))
         .layer(cors)
         .with_state(handler.clone());
-
     // Get the bind address
-    let addr: String = std::env::var("BIND_ADDR")
+    let http_addr: String = std::env::var("BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:6001".to_string())
         .parse()
         .expect("Invalid bind address");
-    tracing::info!("Starting server on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+
+    let metrics_server = Router::new()
+        .route("/metrics", get(metrics))
+        .with_state(handler.clone());
+    let metrics_addr: String = std::env::var("BIND_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9601".to_string())
+        .parse()
+        .expect("Invalid bind address");
+
+    // Start the servers
+
+
+    tracing::info!("Starting server on {}", http_addr);
+    tracing::info!("Starting metrics server on {}", metrics_addr);
+    let http_listener = tokio::net::TcpListener::bind(http_addr).await?;
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+    let http_server = axum::serve(http_listener, http_server);
+    let metrics_server = axum::serve(metrics_listener, metrics_server);
+
+    join!(
+        http_server,
+        metrics_server,
+    );
+
 
     Ok(())
 }
@@ -196,4 +266,38 @@ async fn shutdown_signal() {
     }
 
     tracing::info!("Shutdown signal received, starting graceful shutdown");
+}
+
+pub async fn metrics(State(handler): State<Arc<ConnectionHandler>>) -> Response<String> {
+    Log::info("Metrics endpoint called");
+
+    let metrics_data = match handler.metrics.clone() {
+        Some(metrics_data) => {
+            Log::info("Metrics endpoint");
+            let metrics_data = metrics_data.lock().await;
+            metrics_data.mark_horizontal_adapter_request_received("sockudo");
+            metrics_data.get_metrics_as_plaintext().await
+        },
+        None => {
+            return Response::builder()
+                .status(200)
+                .header("X-Custom-Foo", "Bar")
+                .body("No metrics available".to_string())
+                .unwrap();
+        }
+    };
+
+    // Simple solution using a tuple
+    Log::info(format!("Metrics: {:?}", metrics_data));
+    let mut headers = HashMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    let response = Response::builder()
+        .status(200)
+        .header("X-Custom-Foo", "Bar")
+        .body(metrics_data)
+        .unwrap();
+    response
 }

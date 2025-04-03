@@ -232,7 +232,43 @@ pub struct RedisQueueConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimiterConfig {
     pub driver: String,
+    pub default_limit_per_second: u32,
+    pub default_window_seconds: u64,
+    pub api_rate_limit: RateLimit,
+    pub websocket_rate_limit: RateLimit,
     pub redis: RedisConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimit {
+    pub max_requests: u32,
+    pub window_seconds: u64,
+    pub identifier: Option<String>,
+}
+
+// Default implementation for RateLimiterConfig
+impl Default for RateLimiterConfig {
+    fn default() -> Self {
+        Self {
+            driver: "memory".to_string(),
+            default_limit_per_second: 60,
+            default_window_seconds: 60,
+            api_rate_limit: RateLimit {
+                max_requests: 60,
+                window_seconds: 60,
+                identifier: Some("api".to_string()),
+            },
+            websocket_rate_limit: RateLimit {
+                max_requests: 10,
+                window_seconds: 60,
+                identifier: Some("websocket".to_string()),
+            },
+            redis: RedisConfig {
+                redis_options: HashMap::new(),
+                cluster_mode: false,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +317,7 @@ impl Default for ServerOptions {
                     nodes_number: None,
                 },
             },
+            rate_limiter: RateLimiterConfig::default(),
             // ... other default values
             debug: false,
             port: 6001,

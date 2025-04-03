@@ -40,7 +40,7 @@ impl Namespace {
         &self,
         socket_id: SocketId,
         socket: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
-        app_manager: &Arc<dyn AppManager + Send + Sync>
+        app_manager: &Arc<dyn AppManager + Send + Sync>,
     ) {
         // Create channel for message passing
         let (tx, mut rx) = mpsc::unbounded_channel();

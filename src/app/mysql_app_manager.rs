@@ -1,4 +1,5 @@
 use super::config::App;
+use crate::app::manager::AppManager;
 use crate::error::{Error, Result};
 use crate::log::Log;
 use crate::token::Token;
@@ -10,7 +11,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::time::interval;
-use crate::app::manager::AppManager;
 
 /// Configuration for MySQL App Manager
 #[derive(Debug, Clone)]
@@ -22,7 +22,7 @@ pub struct MySQLConfig {
     pub database: String,
     pub table_name: String,
     pub connection_pool_size: u32,
-    pub cache_ttl: u64, // in seconds
+    pub cache_ttl: u64,              // in seconds
     pub cache_cleanup_interval: u64, // in seconds
 }
 
@@ -36,7 +36,7 @@ impl Default for MySQLConfig {
             database: "sockudo".to_string(),
             table_name: "applications".to_string(),
             connection_pool_size: 10,
-            cache_ttl: 300, // 5 minutes
+            cache_ttl: 300,             // 5 minutes
             cache_cleanup_interval: 60, // 1 minute
         }
     }
@@ -52,7 +52,10 @@ pub struct MySQLAppManager {
 impl MySQLAppManager {
     /// Create a new MySQL-based AppManager with the provided configuration
     pub async fn new(config: MySQLConfig) -> Result<Self> {
-        Log::info(format!("Initializing MySQL AppManager with database {}", config.database));
+        Log::info(format!(
+            "Initializing MySQL AppManager with database {}",
+            config.database
+        ));
 
         // Build connection string with proper URL encoding for password
         let password = urlencoding::encode(&config.password);
@@ -124,7 +127,10 @@ impl MySQLAppManager {
                 }
 
                 if !expired_keys.is_empty() {
-                    Log::info(format!("Removed {} expired cache entries", expired_keys.len()));
+                    Log::info(format!(
+                        "Removed {} expired cache entries",
+                        expired_keys.len()
+                    ));
                 }
             }
         });
@@ -186,7 +192,10 @@ impl MySQLAppManager {
         }
 
         // Not in cache or expired, fetch from database
-        Log::info(format!("Cache miss for app {}, fetching from database", app_id));
+        Log::info(format!(
+            "Cache miss for app {}, fetching from database",
+            app_id
+        ));
 
         // Use a query_as that matches your App struct
         // Create the query with the correct table name
@@ -223,7 +232,8 @@ impl MySQLAppManager {
             let app = Arc::new(app_row.into_app());
 
             // Update cache
-            self.cache.insert(app_id.to_string(), (app.clone(), Instant::now()));
+            self.cache
+                .insert(app_id.to_string(), (app.clone(), Instant::now()));
 
             Ok(Some(app))
         } else {
@@ -242,7 +252,10 @@ impl MySQLAppManager {
         }
 
         // Not found in cache, query database
-        Log::info(format!("Cache miss for app key {}, fetching from database", key));
+        Log::info(format!(
+            "Cache miss for app key {}, fetching from database",
+            key
+        ));
 
         let query = format!(
             r#"SELECT
@@ -330,7 +343,8 @@ impl MySQLAppManager {
 
         // Update cache
         let app_arc = Arc::new(app);
-        self.cache.insert(app_arc.id.clone(), (app_arc, Instant::now()));
+        self.cache
+            .insert(app_arc.id.clone(), (app_arc, Instant::now()));
 
         Ok(())
     }
@@ -383,7 +397,8 @@ impl MySQLAppManager {
 
         // Update cache
         let app_arc = Arc::new(app);
-        self.cache.insert(app_arc.id.clone(), (app_arc, Instant::now()));
+        self.cache
+            .insert(app_arc.id.clone(), (app_arc, Instant::now()));
 
         Ok(())
     }
@@ -393,10 +408,7 @@ impl MySQLAppManager {
         Log::info(format!("Removing app: {}", app_id));
 
         // Prepare the query with proper table name
-        let query = format!(
-            r#"DELETE FROM `{}` WHERE id = ?"#,
-            self.config.table_name
-        );
+        let query = format!(r#"DELETE FROM `{}` WHERE id = ?"#, self.config.table_name);
 
         let result = sqlx::query(&query)
             .bind(app_id)
@@ -471,8 +483,15 @@ impl MySQLAppManager {
     }
 
     /// Validate a signature against an app's secret
-    pub async fn validate_signature(&self, app_id: &str, signature: &str, body: &str) -> Result<bool> {
-        let app = self.get_app(app_id).await?
+    pub async fn validate_signature(
+        &self,
+        app_id: &str,
+        signature: &str,
+        body: &str,
+    ) -> Result<bool> {
+        let app = self
+            .get_app(app_id)
+            .await?
             .ok_or_else(|| Error::InvalidAppKey)?;
 
         let token = Token::new(app.key.clone(), app.secret.clone());
@@ -483,7 +502,9 @@ impl MySQLAppManager {
 
     /// Validate if a channel name is valid for an app
     pub async fn validate_channel_name(&self, app_id: &str, channel: &str) -> Result<()> {
-        let app = self.get_app(app_id).await?
+        let app = self
+            .get_app(app_id)
+            .await?
             .ok_or_else(|| Error::InvalidAppKey)?;
 
         let max_length = app.max_channel_name_length.unwrap_or(200);
@@ -507,7 +528,9 @@ impl MySQLAppManager {
 
     /// Check if client events are enabled for an app
     pub async fn can_handle_client_events(&self, app_key: &str) -> Result<bool> {
-        Ok(self.get_app_by_key(app_key).await?
+        Ok(self
+            .get_app_by_key(app_key)
+            .await?
             .map(|app| app.enable_client_messages)
             .unwrap_or(false))
     }
@@ -525,7 +548,9 @@ impl MySQLAppManager {
         let signature = parts[1..].join(":");
 
         // Get app config
-        let app = self.get_app_by_key(app_key).await?
+        let app = self
+            .get_app_by_key(app_key)
+            .await?
             .ok_or_else(|| Error::InvalidAppKey)?;
 
         // Create string to sign: socket_id
@@ -604,7 +629,6 @@ impl AppManager for MySQLAppManager {
         self.register_app(config_clone).await
     }
 
-
     async fn update_app(&self, config: App) -> Result<()> {
         // This calls our implementation method
         self.update_app(config).await
@@ -644,7 +668,6 @@ impl AppManager for MySQLAppManager {
     async fn validate_signature(&self, app_id: &str, signature: &str, body: &str) -> Result<bool> {
         // For the sync interface, poll the async function in a blocking manner
         self.validate_signature(app_id, signature, body).await
-
     }
 
     async fn validate_channel_name(&self, app_id: &str, channel: &str) -> Result<()> {

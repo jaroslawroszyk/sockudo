@@ -462,7 +462,7 @@ impl Adapter for RedisClusterAdapter {
         socket_id: SocketId,
         socket: WebSocketWrite<WriteHalf<TokioIo<Upgraded>>>,
         app_id: &str,
-        app_manager: &Arc<dyn AppManager + Send + Sync>
+        app_manager: &Arc<dyn AppManager + Send + Sync>,
     ) -> Result<()> {
         let mut horizontal = self.horizontal.lock().await;
         horizontal

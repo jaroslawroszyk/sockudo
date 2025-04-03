@@ -7,19 +7,24 @@ use crate::channel::{ChannelType, PresenceMemberInfo};
 use crate::log::Log;
 use crate::protocol::messages::{ErrorData, MessageData, PusherApiMessage, PusherMessage};
 use crate::websocket::{SocketId, WebSocketRef};
-use crate::{channel::ChannelManager, error::{Error, Result}};
+use crate::{
+    channel::ChannelManager,
+    error::{Error, Result},
+};
 use fastwebsockets::{upgrade, FragmentCollectorRead, Frame, OpCode, WebSocketError};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use crate::metrics::MetricsInterface;
 
 pub struct ConnectionHandler {
     pub(crate) app_manager: Arc<dyn AppManager + Send + Sync>,
     pub(crate) channel_manager: Arc<RwLock<ChannelManager>>,
     pub(crate) connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>>,
     pub(crate) cache_manager: Arc<Mutex<dyn CacheManager + Send + Sync>>,
+    pub(crate) metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>,
 }
 
 impl ConnectionHandler {
@@ -28,12 +33,14 @@ impl ConnectionHandler {
         channel_manager: Arc<RwLock<ChannelManager>>,
         connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>>,
         cache_manager: Arc<Mutex<dyn CacheManager + Send + Sync>>,
+        metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>,
     ) -> Self {
         Self {
             app_manager,
             channel_manager,
             connection_manager,
             cache_manager,
+            metrics,
         }
     }
 
@@ -62,11 +69,7 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    pub async fn handle_socket(
-        &self,
-        fut: upgrade::UpgradeFut,
-        app_key: String,
-    ) -> Result<()> {
+    pub async fn handle_socket(&self, fut: upgrade::UpgradeFut, app_key: String) -> Result<()> {
         // Get app by key - this needs to handle both sync and potentially async implementations
         let app = self.app_manager.get_app_by_key(&app_key).await.unwrap();
         if app.is_none() {
@@ -187,7 +190,7 @@ impl ConnectionHandler {
                         .and_then(|d| serde_json::to_value(d).ok())
                         .unwrap_or_default(),
                 )
-                    .await
+                .await
             }
             _ => Ok(()),
         };
@@ -211,11 +214,7 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    pub async fn handle_ping(
-        &self,
-        app_id: &str,
-        socket_id: &SocketId,
-    ) -> Result<()> {
+    pub async fn handle_ping(&self, app_id: &str, socket_id: &SocketId) -> Result<()> {
         self.connection_manager
             .lock()
             .await
@@ -273,7 +272,7 @@ impl ConnectionHandler {
         if app.is_none() {
             return Err(Error::InvalidAppKey);
         }
-        
+
         // Validate authentication in a single read lock scope
         let is_authenticated = {
             let channel_manager = self.channel_manager.read().await;
@@ -427,7 +426,8 @@ impl ConnectionHandler {
         }
 
         // If we have a missed cache for this channel, send it
-        self.send_missed_cache_if_exists(app_id, socket_id, channel).await?;
+        self.send_missed_cache_if_exists(app_id, socket_id, channel)
+            .await?;
 
         Ok(())
     }
@@ -653,7 +653,12 @@ impl ConnectionHandler {
         };
 
         // Verify client events are enabled
-        if !self.app_manager.can_handle_client_events(&app_key).await.unwrap() {
+        if !self
+            .app_manager
+            .can_handle_client_events(&app_key)
+            .await
+            .unwrap()
+        {
             return Err(Error::ClientEventError(
                 "Client events are not enabled for this app".into(),
             ));
@@ -750,11 +755,7 @@ impl ConnectionHandler {
             .await
     }
 
-    async fn send_connection_established(
-        &self,
-        app_id: &str,
-        socket_id: &SocketId,
-    ) -> Result<()> {
+    async fn send_connection_established(&self, app_id: &str, socket_id: &SocketId) -> Result<()> {
         let message = PusherMessage::connection_established(socket_id.0.clone());
         self.connection_manager
             .lock()
@@ -763,11 +764,7 @@ impl ConnectionHandler {
             .await
     }
 
-    async fn handle_disconnect(
-        &self,
-        app_id: &str,
-        socket_id: &SocketId,
-    ) -> Result<()> {
+    async fn handle_disconnect(&self, app_id: &str, socket_id: &SocketId) -> Result<()> {
         // First, get all the data we need
         let (subscription_channels, user_id) = {
             let mut connection_manager = self.connection_manager.lock().await;
@@ -803,7 +800,10 @@ impl ConnectionHandler {
                     .unsubscribe(socket_id.0.as_str(), &channel, app_id, user_id.as_deref())
                     .await
                 {
-                    Log::error(format!("Error unsubscribing from channel {}: {}", channel, e));
+                    Log::error(format!(
+                        "Error unsubscribing from channel {}: {}",
+                        channel, e
+                    ));
                     continue;
                 }
 
@@ -838,7 +838,10 @@ impl ConnectionHandler {
             let _ = connection_manager
                 .remove_connection(socket_id, app_id)
                 .await;
-            Log::info(format!("Successfully removed connection for socket: {}", socket_id));
+            Log::info(format!(
+                "Successfully removed connection for socket: {}",
+                socket_id
+            ));
         }
 
         Ok(())
@@ -886,7 +889,10 @@ impl ConnectionHandler {
                 Log::info(format!("Message sent to channel {} successfully", channel));
             }
             Err(e) => {
-                Log::error(format!("Failed to send message to channel {}: {:?}", channel, e));
+                Log::error(format!(
+                    "Failed to send message to channel {}: {:?}",
+                    channel, e
+                ));
             }
         }
     }
