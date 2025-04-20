@@ -14,6 +14,7 @@ pub mod utils;
 mod websocket;
 mod ws_handler;
 mod metrics;
+mod webhook;
 
 use std::collections::HashMap;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -43,7 +44,7 @@ use crate::app::manager::AppManager;
 use crate::app::memory_app_manager::MemoryAppManager;
 use crate::cache::manager::CacheManager;
 use crate::cache::redis_cache_manager::{RedisCacheConfig, RedisCacheManager};
-use crate::http_handler::{batch_events, channel, events, terminate_user_connections, up, usage};
+use crate::http_handler::{batch_events, channel, channels, events, terminate_user_connections, up, usage};
 use crate::ws_handler::handle_ws_upgrade;
 use crate::{
     adapter::{Adapter, ConnectionHandler},
@@ -87,8 +88,7 @@ async fn main() -> Result<()> {
         Err(_) => todo!(),
     };
     let cache_manager = RedisCacheManager::new(RedisCacheConfig::default())
-        .await
-        .unwrap();
+        .await?;
     connection_manager.init().await;
     // let connection_manager = LocalAdapter::new();
     let connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>> =
@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
         enabled: true,
         ..Default::default()
     };
-    app_manager.register_app(demo_app);
+    app_manager.register_app(demo_app).await.expect("TODO: panic message");
     let metrics_driver = PrometheusMetricsDriver::new(9601, Some("sockudo")).await;
     let metrics_driver = Arc::new(Mutex::new(metrics_driver));
 
@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
         .route("/app/{key}", get(handle_ws_upgrade))
         .route("/apps/{appId}/events", post(events))
         .route("/apps/{appId}/batch_events", post(batch_events))
+        .route("/apps/{app_id}/channels", get(channels))
         // .route_layer(rate_limit_middleware::with_path_limiter(
         //     api_limiter.clone(),
         //     rate_limit_middleware::RateLimitOptions {

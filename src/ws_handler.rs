@@ -4,6 +4,7 @@ use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use fastwebsockets::upgrade;
 use std::sync::Arc;
+use crate::log::Log;
 
 // WebSocket upgrade handler
 pub async fn handle_ws_upgrade(
@@ -13,9 +14,10 @@ pub async fn handle_ws_upgrade(
     State(handler): State<Arc<ConnectionHandler>>,
 ) -> impl IntoResponse {
     let (response, fut) = ws.upgrade().unwrap();
+    let metrics = handler.metrics.clone();
     tokio::task::spawn(async move {
-        if let Err(e) = handler.handle_socket(fut, app_key).await {
-            eprintln!("Error in websocket adapter: {}", e);
+        if let Err(e) = handler.handle_socket(fut, app_key, metrics).await {
+            Log::error(format!("Error handling socket: {}", e));
         }
     });
     response

@@ -198,6 +198,7 @@ impl DynamoDbAppManager {
                 } else {
                     None
                 },
+                webhooks: None,
             })
         } else {
             Err(Error::InternalError(

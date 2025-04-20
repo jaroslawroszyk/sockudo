@@ -69,9 +69,9 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    pub async fn handle_socket(&self, fut: upgrade::UpgradeFut, app_key: String) -> Result<()> {
+    pub async fn handle_socket(&self, fut: upgrade::UpgradeFut, app_key: String, metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>) -> Result<()> {
         // Get app by key - this needs to handle both sync and potentially async implementations
-        let app = self.app_manager.get_app_by_key(&app_key).await.unwrap();
+        let app = self.app_manager.get_app_by_key(&app_key).await?;
         if app.is_none() {
             return Err(Error::InvalidAppKey);
         }
@@ -97,6 +97,14 @@ impl ConnectionHandler {
                     Log::error(format!("Failed to add socket: {}", e));
                     WebSocketError::ConnectionClosed
                 })?;
+            match self.metrics {
+                Some(ref metrics) => {
+                    let mut metrics = metrics.lock().await;
+                    metrics
+                        .mark_new_connection(&app.id, &socket_id)
+                }
+                None => {}
+            }
         }
 
         if let Err(e) = self.send_connection_established(&app.id, &socket_id).await {
@@ -268,7 +276,7 @@ impl ConnectionHandler {
         };
 
         // Validate app
-        let app = self.app_manager.get_app(app_id).await.unwrap();
+        let app = self.app_manager.get_app(app_id).await?;
         if app.is_none() {
             return Err(Error::InvalidAppKey);
         }
@@ -656,8 +664,7 @@ impl ConnectionHandler {
         if !self
             .app_manager
             .can_handle_client_events(&app_key)
-            .await
-            .unwrap()
+            .await?
         {
             return Err(Error::ClientEventError(
                 "Client events are not enabled for this app".into(),
@@ -860,6 +867,22 @@ impl ConnectionHandler {
         });
 
         response
+    }
+
+    pub async fn channels(&self, app_id: &str) -> Value {
+        let mut connection_manager = self.connection_manager.lock().await;
+        let channels = connection_manager.get_channels_with_socket_count(app_id).await;
+        let mut response = json!({});
+        channels.unwrap().iter_mut().for_each(|channel| {
+            let channel_name = channel.key().clone();
+            let socket_count = channel.value();
+            response[channel_name] = json!({
+                "occupied": socket_count > &0,
+                "subscription_count": socket_count,
+            });
+        });
+        response
+        
     }
 
     pub async fn send_message(

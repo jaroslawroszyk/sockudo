@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use crate::webhook::types::Webhook;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct App {
@@ -32,6 +33,8 @@ pub struct App {
     pub max_event_batch_size: Option<u32>,
     #[serde(default)]
     pub enable_user_authentication: Option<bool>,
+    #[serde(default)]
+    pub webhooks: Option<Vec<Webhook>>,
 }
 
 // Helper functions to deserialize numbers from strings
@@ -77,6 +80,7 @@ impl Default for App {
             max_event_payload_in_kb: None,
             max_event_batch_size: None,
             enable_user_authentication: None,
+            webhooks: None,
         }
     }
 }

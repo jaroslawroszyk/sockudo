@@ -23,6 +23,7 @@ pub enum RequestType {
     ChannelSocketsCount,
     SocketExistsInChannel,
     TerminateUserConnections,
+    ChannelsWithSocketsCount
 }
 
 /// Request body for horizontal communication
@@ -44,9 +45,11 @@ pub struct ResponseBody {
     pub node_id: String,
     pub app_id: String,
     pub members: HashMap<String, PresenceMemberInfo>,
+    pub channels_with_sockets_count: HashMap<String, usize>,
     pub socket_ids: Vec<String>,
     pub sockets_count: usize,
     pub exists: bool,
+    pub channels: HashSet<String>,
 }
 
 /// Message for broadcasting events
@@ -75,8 +78,8 @@ pub struct HorizontalAdapter {
     /// Local adapter for handling local connections
     pub local_adapter: LocalAdapter,
 
-    /// Pending requests map
-    pub pending_requests: HashMap<String, PendingRequest>,
+    /// Pending requests map - Use DashMap for thread-safe access
+    pub pending_requests: DashMap<String, PendingRequest>,
 
     /// Timeout for requests in milliseconds
     pub requests_timeout: u64,
@@ -88,7 +91,7 @@ impl HorizontalAdapter {
         Self {
             node_id: Uuid::new_v4().to_string(),
             local_adapter: LocalAdapter::new(),
-            pending_requests: HashMap::new(),
+            pending_requests: DashMap::new(),
             requests_timeout: 5000, // Default 5 seconds
         }
     }
@@ -98,7 +101,7 @@ impl HorizontalAdapter {
         // Clone data needed for the task
         let node_id = self.node_id.clone();
         let timeout = self.requests_timeout;
-        let mut pending_requests_clone = self.pending_requests.clone();
+        let pending_requests_clone = self.pending_requests.clone();
 
         // Spawn a background task to clean up stale requests
         tokio::spawn(async move {
@@ -110,7 +113,9 @@ impl HorizontalAdapter {
                 let mut expired_requests = Vec::new();
 
                 // We can't modify pending_requests while iterating
-                for (request_id, request) in &pending_requests_clone {
+                for entry in &pending_requests_clone {
+                    let request_id = entry.key();
+                    let request = entry.value();
                     if now.duration_since(request.start_time).as_millis() > timeout as u128 {
                         expired_requests.push(request_id.clone());
                     }
@@ -145,7 +150,9 @@ impl HorizontalAdapter {
             members: HashMap::new(),
             socket_ids: Vec::new(),
             sockets_count: 0,
+            channels_with_sockets_count: HashMap::new(),
             exists: false,
+            channels: Default::default(),
         };
 
         // Process based on request type
@@ -201,6 +208,16 @@ impl HorizontalAdapter {
                         .await;
                     response.exists = true;
                 }
+            },
+            RequestType::ChannelsWithSocketsCount => {
+                if let Some(channel) = &request.channel {
+                    // Get channels with socket count from local adapter
+                    let channels = self
+                        .local_adapter
+                        .get_channel(&request.app_id, channel)
+                        .await?;
+                    response.sockets_count = channels.len();
+                }
             }
         }
 
@@ -211,8 +228,8 @@ impl HorizontalAdapter {
     /// Process a response received from another node
     pub async fn process_response(&mut self, response: ResponseBody) -> Result<()> {
         // Get the pending request
-        if let Some(request) = self.pending_requests.get_mut(&response.request_id) {
-            // Add response to the list
+        if let Some(mut request) = self.pending_requests.get_mut(&response.request_id) {
+            // Add response to the list - now works with the mut binding
             request.responses.push(response);
         }
 
@@ -278,7 +295,9 @@ impl HorizontalAdapter {
             members: HashMap::new(),
             socket_ids: Vec::new(),
             sockets_count: 0,
+            channels_with_sockets_count: HashMap::new(),
             exists: false,
+            channels: Default::default(),
         };
 
         // Wait for responses until timeout or we have enough responses
@@ -299,9 +318,9 @@ impl HorizontalAdapter {
         }
 
         // Get all responses
-        if let Some(request) = self.pending_requests.remove(&request_id) {
+        if let Some((_, request)) = self.pending_requests.remove(&request_id) {
             // Combine the results
-            for response in request.responses {
+            for response in request.responses {  // Also note it's "responses" not "response"
                 // Add members
                 combined_response.members.extend(response.members);
 
@@ -313,6 +332,14 @@ impl HorizontalAdapter {
 
                 // If any node says socket exists, it exists
                 combined_response.exists = combined_response.exists || response.exists;
+
+                // Combine channels with sockets count
+                for (channel, sockets) in response.channels_with_sockets_count {
+                    combined_response
+                        .channels_with_sockets_count
+                        .entry(channel)
+                        .or_insert_with(|| 0);
+                }
             }
         }
 

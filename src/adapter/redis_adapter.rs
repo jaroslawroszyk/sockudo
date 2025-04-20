@@ -173,7 +173,7 @@ impl RedisAdapter {
         let node_id = {
             let horizontal_lock = horizontal_arc.lock().await;
             horizontal_lock.node_id.clone()
-        }; // Lock released
+        };
 
         // Spawn the main listener task
         tokio::spawn(async move {
@@ -544,27 +544,31 @@ impl Adapter for RedisAdapter {
         channel: &str,
     ) -> Result<HashMap<String, PresenceMemberInfo>> {
         let node_count = self.get_node_count().await?; // Fetch node count first
-        let mut horizontal = self.horizontal.lock().await; // Lock for local + remote request
 
-        // Get local members first
-        let mut members = horizontal
-            .local_adapter
-            .get_channel_members(app_id, channel)
-            .await?;
+        // Get local members with minimal lock duration
+        let mut members = {
+            let mut horizontal = self.horizontal.lock().await;
+            horizontal
+                .local_adapter
+                .get_channel_members(app_id, channel)
+                .await?
+        };
 
-        // Get distributed members if needed
+        // Get distributed members if needed, with a separate lock acquisition
         if node_count > 1 {
-            // send_request handles its own locking/timing
-            let response_data = horizontal
-                .send_request(
-                    app_id,
-                    RequestType::ChannelMembers,
-                    Some(channel),
-                    None,
-                    None,
-                    node_count,
-                )
-                .await?;
+            let response_data = {
+                let mut horizontal = self.horizontal.lock().await;
+                horizontal
+                    .send_request(
+                        app_id,
+                        RequestType::ChannelMembers,
+                        Some(channel),
+                        None,
+                        None,
+                        node_count,
+                    )
+                    .await?
+            };
             members.extend(response_data.members);
         }
 
@@ -841,5 +845,49 @@ impl Adapter for RedisAdapter {
         }
 
         Ok(())
+    }
+
+    async fn get_channels_with_socket_count(&mut self, app_id: &str) -> Result<DashMap<String, usize>> {
+        let node_count = self.get_node_count().await?; // Get count first
+        let mut horizontal = self.horizontal.lock().await; // Lock for local + potential remote
+
+        // Then broadcast to other nodes if needed
+        if node_count > 1 {
+            // send_request handles its own locking/timing
+            // We ignore the result here as it's a "fire and forget" termination broadcast
+           match horizontal
+                .send_request(
+                    app_id,
+                    RequestType::ChannelsWithSocketsCount,
+                    None,
+                    None,
+                    None,
+                    node_count,
+                )
+                .await {
+                Ok(response_data) => {
+                    // Merge the local and remote data
+                    let mut channels = horizontal
+                        .local_adapter
+                        .get_channels_with_socket_count(app_id)
+                        .await?;
+                    for channel in response_data.channels_with_sockets_count {
+                        channels.insert(channel.0, channel.1);
+                    }
+                    return Ok(channels);
+                }
+                Err(e) => {
+                    Log::error(format!(
+                        "Failed to get remote channels with socket count: {}",
+                        e
+                    ));
+                }
+           }
+        }
+
+        Ok(horizontal
+            .local_adapter
+            .get_channels_with_socket_count(app_id)
+            .await?)
     }
 }

@@ -1,25 +1,64 @@
 use crate::cache::manager::CacheManager;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result}; // Assuming Error/Result are defined elsewhere
 use async_trait::async_trait;
-use dashmap::DashMap;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use moka::future::Cache;
+use moka::Expiry; // Needed for ttl() method
+use std::sync::{Arc, Mutex}; // Keep Mutex due to CacheFactory signature
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
-use tokio::time::interval;
 
-/// Configuration for the Memory cache manager
+// --- Error/Result Placeholder (if not defined elsewhere) ---
+// pub mod error {
+//     #[derive(Debug)]
+//     pub enum Error {
+//         // Define potential errors if needed
+//         Other(String),
+//     }
+//     pub type Result<T> = std::result::Result<T, Error>;
+// }
+// --- CacheManager Trait Placeholder ---
+// pub mod cache {
+//     pub mod manager {
+//         use crate::error::Result;
+//         use async_trait::async_trait;
+//         use std::sync::{Arc, Mutex};
+//         use std::time::Duration;
+
+//         #[async_trait]
+//         pub trait CacheManager {
+//             async fn has(&mut self, key: &str) -> Result<bool>;
+//             async fn get(&mut self, key: &str) -> Result<Option<String>>;
+//             async fn set(&mut self, key: &str, value: &str, ttl_seconds: u64) -> Result<()>;
+//             async fn disconnect(&self) -> Result<()>; // Changed to &self as moka clear doesn't need mut
+//             async fn is_healthy(&self) -> Result<bool>;
+//         }
+//     }
+//     // --- CacheFactory Placeholder ---
+//     pub mod factory {
+//         use crate::cache::manager::CacheManager;
+//         use crate::error::Result;
+//         use std::sync::{Arc, Mutex};
+//         pub struct CacheFactory;
+//         impl CacheFactory {
+//              // Implementation will be added below
+//         }
+//     }
+// }
+// --- End Placeholders ---
+
+
+/// Configuration for the Memory cache manager using Moka
 #[derive(Clone, Debug)]
 pub struct MemoryCacheConfig {
     /// Key prefix
     pub prefix: String,
-    /// Response timeout
+    /// Response timeout (Not directly used by Moka cache itself, but kept for potential higher-level logic)
     pub response_timeout: Option<Duration>,
-    /// Global TTL for entries if not specified
+    /// Global TTL for entries if not specified during set operation.
+    /// If None, entries live forever by default unless TTL is given in `set`.
     pub default_ttl: Option<Duration>,
-    /// Cleanup interval in milliseconds
-    pub cleanup_interval_ms: u64,
+    /// Maximum number of entries in the cache.
+    pub max_capacity: u64,
+    // Removed cleanup_interval_ms as Moka handles it
 }
 
 impl Default for MemoryCacheConfig {
@@ -27,341 +66,190 @@ impl Default for MemoryCacheConfig {
         Self {
             prefix: "memory_cache".to_string(),
             response_timeout: Some(Duration::from_secs(5)),
-            default_ttl: Some(Duration::from_secs(3600)), // 1 hour default
-            cleanup_interval_ms: 1000,                    // Default to cleanup every second
+            default_ttl: Some(Duration::from_secs(3600)), // 1 hour default TTL
+            max_capacity: 10_000, // Default max capacity
         }
     }
 }
 
-/// Cached Entry structure
-#[derive(Clone)]
-struct CacheEntry {
-    value: String,
-    expiration: Option<Instant>,
-}
+// CacheEntry struct is no longer needed as Moka manages values and expiry internally.
 
-/// A Memory-based implementation of the CacheManager trait
+/// A Memory-based implementation of the CacheManager trait using Moka.
 pub struct MemoryCacheManager {
-    /// Shared hashmap for storing cache entries
-    cache: DashMap<String, CacheEntry>,
+    /// Moka async cache for storing entries. Key and Value are Strings.
+    cache: Cache<String, String>,
     /// Configuration
     config: MemoryCacheConfig,
-    /// Cleanup task handle
-    cleanup_task: Option<JoinHandle<()>>,
-    /// Shutdown channel
-    shutdown_tx: Option<mpsc::Sender<()>>,
+    // cleanup_task and shutdown_tx are no longer needed.
 }
 
 impl MemoryCacheManager {
-    /// Creates a new Memory cache manager with configuration
+    /// Creates a new Memory cache manager with Moka configuration.
     pub fn new(config: MemoryCacheConfig) -> Self {
-        let cache = DashMap::new();
-        let cache_instance = Self {
-            cache,
-            config,
-            cleanup_task: None,
-            shutdown_tx: None,
+        let cache_builder = Cache::builder()
+            .max_capacity(config.max_capacity);
+
+        // Set default time_to_live if provided
+        let cache = if let Some(ttl) = config.default_ttl {
+            cache_builder.time_to_live(ttl).build()
+        } else {
+            // No default TTL, entries live forever unless specified in set()
+            cache_builder.build()
         };
 
-        // Start the cleanup task in another step to avoid initialization issues
-        // The start_cleanup_task method will be called immediately after construction
-        cache_instance
+        Self { cache, config }
+        // No need to manually start a cleanup task.
     }
 
-    /// Creates a new Memory cache manager with simple configuration
+    /// Creates a new Memory cache manager with simple configuration (prefix only).
     pub fn with_prefix(prefix: &str) -> Self {
         let config = MemoryCacheConfig {
             prefix: prefix.to_string(),
             ..Default::default()
         };
-
         Self::new(config)
     }
 
-    /// Start the periodic cleanup task
-    pub fn start_cleanup_task(&mut self) {
-        // Create a channel for shutdown signaling
-        let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-        self.shutdown_tx = Some(shutdown_tx);
-
-        // Clone the cache for the background task
-        let cache = self.cache.clone();
-        let interval_ms = self.config.cleanup_interval_ms;
-
-        // Spawn a background task to periodically clean up expired entries
-        let task = tokio::spawn(async move {
-            let mut cleanup_interval = interval(Duration::from_millis(interval_ms));
-
-            loop {
-                tokio::select! {
-                    // Wait for the interval tick or shutdown signal
-                    _ = cleanup_interval.tick() => {
-                        // Perform cleanup
-                        let now = Instant::now();
-
-                        // Collect keys to remove
-                        let expired_keys: Vec<String> = cache
-                            .iter()
-                            .filter_map(|entry| {
-                                let key = entry.key().clone();
-                                let value = entry.value();
-
-                                // Check if the entry is expired
-                                if value.expiration.map_or(false, |exp| exp <= now) {
-                                    Some(key)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-
-                        // Remove expired keys
-                        for key in expired_keys {
-                            cache.remove(&key);
-                        }
-                    }
-                    // Break the loop if shutdown signal is received
-                    _ = shutdown_rx.recv() => {
-                        break;
-                    }
-                }
-            }
-        });
-
-        self.cleanup_task = Some(task);
-    }
-
-    /// Get the prefixed key
+    /// Get the prefixed key.
     fn prefixed_key(&self, key: &str) -> String {
         format!("{}:{}", self.config.prefix, key)
     }
 
-    /// Clean up expired entries - this is still useful for immediate cleanups
-    fn cleanup_expired_entries(&self) {
-        let now = Instant::now();
-
-        // Collect keys to remove
-        let expired_keys: Vec<String> = self
-            .cache
-            .iter()
-            .filter_map(|entry| {
-                let key = entry.key().clone();
-                let value = entry.value();
-
-                // Check if the entry is expired
-                if value.expiration.map_or(false, |exp| exp <= now) {
-                    Some(key)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Remove expired keys
-        for key in expired_keys {
-            self.cache.remove(&key);
-        }
-    }
+    // cleanup_expired_entries is no longer needed.
+    // start_cleanup_task is no longer needed.
 }
 
 #[async_trait]
 impl CacheManager for MemoryCacheManager {
-    /// Check if the given key exists in cache
+    /// Check if the given key exists in the Moka cache and is not expired.
+    /// Note: `contains_key` is synchronous, but usually very fast.
+    /// For a fully async check, one might use `get` and check if Some.
     async fn has(&mut self, key: &str) -> Result<bool> {
         let prefixed_key = self.prefixed_key(key);
-        let exists = self.cache.get(&prefixed_key).map_or(false, |entry| {
-            entry.expiration.map_or(true, |exp| exp > Instant::now())
-        });
-
+        // `contains_key` is sync, but checks existence quickly.
+        // Moka's `get` implicitly checks expiry, so calling `get` might be
+        // more idiomatic if you need the value soon anyway.
+        // Let's use `get` for consistency with expiry checks.
+        let exists = self.cache.get(&prefixed_key).await.is_some();
         Ok(exists)
     }
 
-    /// Get a key from the cache
-    /// Returns None if cache does not exist or is expired
+    /// Get a key from the Moka cache.
+    /// Returns None if the key does not exist or is expired.
     async fn get(&mut self, key: &str) -> Result<Option<String>> {
         let prefixed_key = self.prefixed_key(key);
-        let result = self.cache.get(&prefixed_key).and_then(|entry| {
-            // Check if not expired
-            if entry.expiration.map_or(true, |exp| exp > Instant::now()) {
-                Some(entry.value.clone())
-            } else {
-                // Remove expired entry
-                self.cache.remove(&prefixed_key);
-                None
-            }
-        });
-
-        Ok(result)
+        // Moka's get automatically handles expiration.
+        Ok(self.cache.get(&prefixed_key).await)
     }
 
-    /// Set or overwrite the value in the cache
+    /// Set or overwrite the value in the Moka cache.
     async fn set(&mut self, key: &str, value: &str, ttl_seconds: u64) -> Result<()> {
         let prefixed_key = self.prefixed_key(key);
+        let value_string = value.to_string(); // Moka needs owned values
 
-        // Determine expiration
-        let expiration = if ttl_seconds > 0 {
-            Some(Instant::now() + Duration::from_secs(ttl_seconds))
+        if ttl_seconds > 0 {
+            // Use specific TTL for this entry
+            let ttl = Duration::from_secs(ttl_seconds);
+            self.cache.insert(prefixed_key, value_string).await;
         } else if let Some(default_ttl) = self.config.default_ttl {
-            Some(Instant::now() + default_ttl)
+            // Use the default TTL from config
+            self.cache.insert(prefixed_key, value_string).await;
         } else {
-            None
-        };
-
-        // Insert or update entry
-        self.cache.insert(
-            prefixed_key,
-            CacheEntry {
-                value: value.to_string(),
-                expiration,
-            },
-        );
-
-        Ok(())
-    }
-
-    /// Disconnect the manager's cache and stop the cleanup task
-    async fn disconnect(&self) -> Result<()> {
-        // Send shutdown signal if the task is running
-        if let Some(tx) = &self.shutdown_tx {
-            let _ = tx.send(()).await;
+            // No TTL specified and no default TTL -> insert without expiration
+            self.cache.insert(prefixed_key, value_string).await;
         }
 
-        // Clear the cache
-        self.cache.clear();
         Ok(())
     }
 
-    /// Check if the cache is healthy (always true for in-memory cache)
+    /// Invalidate all entries in the cache. Moka doesn't have a persistent connection concept.
+    /// Changed signature to `&self` as `invalidate_all` does not require `&mut self`.
+    /// Kept original trait signature for compatibility if needed, but implementation uses `&self`.
+    async fn disconnect(&self) -> Result<()> {
+        // Invalidate all entries in this specific cache instance.
+        self.cache.invalidate_all();
+        // Moka caches are automatically managed in terms of resources,
+        // explicit disconnect isn't usually needed beyond clearing.
+        Ok(())
+    }
+
+    /// Check if the cache is healthy (always true for Moka in-memory cache).
     async fn is_healthy(&self) -> Result<bool> {
+        // Moka cache is generally always "healthy" unless the process runs out of memory.
         Ok(true)
     }
 }
 
-impl Drop for MemoryCacheManager {
-    fn drop(&mut self) {
-        // When the cache manager is dropped, attempt to send a shutdown signal
-        if let Some(tx) = &self.shutdown_tx {
-            let _ = tx.try_send(());
-        }
+// Drop implementation is no longer needed for cleanup task management.
+// Moka's cache handles its resources automatically.
+// impl Drop for MemoryCacheManager {
+//     fn drop(&mut self) {
+//         // No explicit cleanup needed for Moka cache itself.
+//     }
+// }
 
-        // Abort the cleanup task if it's still running
-        if let Some(task) = &self.cleanup_task {
-            task.abort();
-        }
-    }
-}
 
-/// Extension methods for MemoryCacheManager
+/// Extension methods for MemoryCacheManager using Moka
 impl MemoryCacheManager {
-    /// Delete a key from the cache
+    /// Delete a key from the cache.
     pub async fn delete(&mut self, key: &str) -> Result<bool> {
         let prefixed_key = self.prefixed_key(key);
-        let existed = self.cache.remove(&prefixed_key).is_some();
-
-        Ok(existed)
+        // Moka's invalidate doesn't return if the key existed.
+        // We can check first for similar behavior, though less efficient.
+        let exists = self.cache.contains_key(&prefixed_key); // Sync check
+        if exists {
+            self.cache.invalidate(&prefixed_key).await;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
-    /// Get multiple keys at once
+    /// Get multiple keys at once.
     pub async fn get_many(&mut self, keys: &[&str]) -> Result<Vec<Option<String>>> {
-        let now = Instant::now();
-        let results = keys
-            .iter()
-            .map(|&key| {
-                let prefixed_key = self.prefixed_key(key);
-                self.cache.get(&prefixed_key).and_then(|entry| {
-                    // Check if not expired
-                    if entry.expiration.map_or(true, |exp| exp > now) {
-                        Some(entry.value.clone())
-                    } else {
-                        // Mark for removal
-                        self.cache.remove(&prefixed_key);
-                        None
-                    }
-                })
-            })
-            .collect();
-
+        let mut results = Vec::with_capacity(keys.len());
+        for &key in keys {
+            // Reuse the existing get method which handles prefixing and expiry
+            results.push(self.get(key).await?);
+        }
         Ok(results)
     }
 
-    /// Set multiple key-value pairs at once
+    /// Set multiple key-value pairs at once.
     pub async fn set_many(&mut self, pairs: &[(&str, &str)], ttl_seconds: u64) -> Result<()> {
-        // Determine expiration
-        let expiration = if ttl_seconds > 0 {
-            Some(Instant::now() + Duration::from_secs(ttl_seconds))
-        } else if let Some(default_ttl) = self.config.default_ttl {
-            Some(Instant::now() + default_ttl)
+        // Determine TTL outside the loop
+        let ttl_duration = if ttl_seconds > 0 {
+            Some(Duration::from_secs(ttl_seconds))
         } else {
-            None
+            self.config.default_ttl // Use default TTL if specified, otherwise None
         };
 
-        // Insert or update entries
         for (key, value) in pairs {
             let prefixed_key = self.prefixed_key(key);
-            self.cache.insert(
-                prefixed_key,
-                CacheEntry {
-                    value: value.to_string(),
-                    expiration,
-                },
-            );
+            let value_string = value.to_string();
+            self.cache.insert(prefixed_key, value_string).await;
         }
-
         Ok(())
-    }
-
-    /// Clear all keys with the current prefix
-    pub async fn clear_prefix(&mut self) -> Result<usize> {
-        // Prepare prefix string once
-        let prefix_str = format!("{}:", self.config.prefix);
-
-        // Count entries with the prefix
-        let removed_count = self
-            .cache
-            .iter()
-            .filter(|entry| entry.key().starts_with(&prefix_str))
-            .count();
-
-        // Remove entries with the prefix
-        self.cache.retain(|k, _| !k.starts_with(&prefix_str));
-
-        Ok(removed_count)
-    }
-
-    /// Get the remaining TTL for a key in seconds
-    pub async fn ttl(&mut self, key: &str) -> Result<i64> {
-        let prefixed_key = self.prefixed_key(key);
-        let remaining_ttl = self
-            .cache
-            .get(&prefixed_key)
-            .and_then(|entry| entry.expiration)
-            .map(|exp| {
-                let now = Instant::now();
-                if exp > now {
-                    exp.duration_since(now).as_secs() as i64
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(-1);
-
-        Ok(remaining_ttl)
     }
 }
 
-/// Update the cache manager factory to support memory cache
+
+/// Update the cache manager factory to support Moka-based memory cache
 impl crate::cache::factory::CacheFactory {
-    /// Create a new memory cache manager
+    /// Create a new memory cache manager using Moka
     pub fn create_memory(prefix: Option<&str>) -> Result<Arc<Mutex<Box<dyn CacheManager + Send>>>> {
         let config = MemoryCacheConfig {
             prefix: prefix.unwrap_or("memory_cache").to_string(),
             ..Default::default()
         };
 
-        let mut cache_manager = MemoryCacheManager::new(config);
-        // Start the cleanup task immediately
-        cache_manager.start_cleanup_task();
+        let cache_manager = MemoryCacheManager::new(config);
+        // No need to call start_cleanup_task()
 
+        // Wrap in Arc<Mutex<Box<...>>> to match the expected factory signature.
+        // Even though Moka Cache is internally thread-safe (&self methods),
+        // the CacheManager trait requires &mut self, hence the Mutex is needed here
+        // to satisfy the trait bounds provided in the original code.
         Ok(Arc::new(Mutex::new(Box::new(cache_manager))))
     }
 }

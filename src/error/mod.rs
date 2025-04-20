@@ -140,6 +140,15 @@ pub enum Error {
 
     #[error("Horizontal adapter error: {0}")]
     HorizontalAdapterError(String),
+
+    #[error("Queue error: {0}")]
+    Queue(String),
+
+    #[error("Config")]
+    Config(String),
+    
+    #[error("Connection Error: {0}")]
+    Connection(String),
 }
 
 // Add conversion to WebSocket close codes

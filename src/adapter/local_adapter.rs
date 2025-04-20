@@ -130,8 +130,8 @@ impl Adapter for LocalAdapter {
         except: Option<&SocketId>,
         app_id: &str,
     ) -> Result<()> {
-        Log::info(&format!("Sending message to channel: {}", channel));
-        Log::info(&format!("Message: {:?}", message));
+        Log::info(format!("Sending message to channel: {}", channel));
+        Log::info(format!("Message: {:?}", message));
         if channel.starts_with("#server-to-user-") {
             let user_id = channel.trim_start_matches("#server-to-user-");
             let namespace = self.get_namespace(app_id).await.unwrap();
@@ -144,7 +144,7 @@ impl Adapter for LocalAdapter {
                     ws.state.socket_id.clone()
                 };
 
-                if except.map_or(true, |sid| sid != &socket_id) {
+                if except != Some(&socket_id) {
                     self.send_message(app_id, &socket_id, message.clone())
                         .await?;
                 }
@@ -155,7 +155,7 @@ impl Adapter for LocalAdapter {
 
             // Iterate through our DashMap of sockets
             for socket_id in sockets.iter().map(|entry| entry.key().clone()) {
-                if except.map_or(true, |sid| sid != &socket_id) {
+                if except != Some(&socket_id) {
                     self.send_message(app_id, &socket_id, message.clone())
                         .await?;
                 }
@@ -268,20 +268,26 @@ impl Adapter for LocalAdapter {
     async fn terminate_user_connections(&mut self, app_id: &str, user_id: &str) -> Result<()> {
         let namespace = self.get_or_create_namespace(app_id).await;
         if let Err(e) = namespace.terminate_user_connections(user_id).await {
-            Log::error(&format!("Failed to terminate user connections: {}", e));
+            Log::error(format!("Failed to terminate user connections: {}", e));
         }
         Ok(())
     }
 
     async fn add_user(&mut self, ws: Arc<Mutex<WebSocket>>) -> Result<()> {
         let app_id = ws.lock().await.state.get_app_key();
-        let namespace = self.get_namespace(&*app_id).await.unwrap();
+        let namespace = self.get_namespace(&app_id).await.unwrap();
         namespace.add_user(ws).await
     }
 
     async fn remove_user(&mut self, ws: Arc<Mutex<WebSocket>>) -> Result<()> {
         let app_id = ws.lock().await.state.get_app_key();
-        let namespace = self.get_namespace(&*app_id).await.unwrap();
+        let namespace = self.get_namespace(&app_id).await.unwrap();
         namespace.remove_user(ws).await
+    }
+
+    async fn get_channels_with_socket_count(&mut self, app_id: &str) -> Result<DashMap<String, usize>> {
+        let namespace = self.get_or_create_namespace(app_id).await;
+        let channels = namespace.get_channels_with_socket_count().await;
+        Ok(channels?)
     }
 }

@@ -618,29 +618,33 @@ impl Adapter for RedisClusterAdapter {
 
     async fn get_channel(&mut self, app_id: &str, channel: &str) -> Result<DashSet<SocketId>> {
         let node_count = self.get_node_count().await?;
-        let mut horizontal = self.horizontal.lock().await; // Lock for local + remote request
 
-        // Start with local channel data
-        let mut result = horizontal
-            .local_adapter
-            .get_channel(app_id, channel)
-            .await?;
+        // Get local channel data with minimal lock duration
+        let mut result = {
+            let mut horizontal = self.horizontal.lock().await;
+            horizontal
+                .local_adapter
+                .get_channel(app_id, channel)
+                .await?
+        };
 
-        // Get distributed channels if needed
+        // Get distributed channels with a separate lock acquisition
         if node_count > 1 {
-            // send_request handles its own locking/timing
-            let response_data = horizontal
-                .send_request(
-                    app_id,
-                    RequestType::ChannelSockets,
-                    Some(channel),
-                    None,
-                    None,
-                    node_count,
-                )
-                .await?;
+            let response_data = {
+                let mut horizontal = self.horizontal.lock().await;
+                horizontal
+                    .send_request(
+                        app_id,
+                        RequestType::ChannelSockets,
+                        Some(channel),
+                        None,
+                        None,
+                        node_count,
+                    )
+                    .await?
+            };
 
-            // Add remote sockets to the result
+            // Add remote sockets to the result (outside of lock)
             for socket_id in response_data.socket_ids {
                 result.insert(SocketId(socket_id));
             }
@@ -873,5 +877,36 @@ impl Adapter for RedisClusterAdapter {
         }
 
         Ok(())
+    }
+
+    async fn get_channels_with_socket_count(&mut self, app_id: &str) -> Result<DashMap<String, usize>> {
+        let node_count = self.get_node_count().await?; // Get count first
+        let mut horizontal = self.horizontal.lock().await; // Lock for local + potential remote
+
+        // Get local channels
+        let local_channels = horizontal
+            .local_adapter
+            .get_channels_with_socket_count(app_id)
+            .await?;
+
+        // Get distributed channels if needed
+        if node_count > 1 {
+            // send_request handles its own locking/timing
+            let response_data = horizontal
+                .send_request(
+                    app_id,
+                    RequestType::ChannelsWithSocketsCount,
+                    None,
+                    None,
+                    None,
+                    node_count,
+                )
+                .await?;
+            for (channel, count) in response_data.channels_with_sockets_count {
+                local_channels.insert(channel, count);
+            }
+        }
+
+        Ok(local_channels)
     }
 }

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 // src/app/traits.rs
 use crate::app::config::App;
 use crate::error::{Error, Result};

@@ -78,8 +78,7 @@ impl ChannelManager {
         {
             let channel = connection_manager
                 .get_channel(app_id, channel_name)
-                .await
-                .unwrap();
+                .await?;
 
             return Ok(JoinResponse {
                 success: true,
@@ -107,8 +106,7 @@ impl ChannelManager {
 
         let total_connections = connection_manager
             .get_channel(app_id, channel_name)
-            .await
-            .unwrap()
+            .await?
             .len();
 
         Ok(JoinResponse {
@@ -156,8 +154,7 @@ impl ChannelManager {
 
         let remaining_connections = connection_manager
             .get_channel(app_id, channel_name)
-            .await
-            .unwrap()
+            .await?
             .len();
 
         if remaining_connections == 0 {

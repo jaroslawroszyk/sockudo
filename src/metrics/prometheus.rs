@@ -2,10 +2,7 @@
 
 use async_trait::async_trait;
 use lazy_static::lazy_static;
-use prometheus::{register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec, GaugeVec, HistogramVec, Opts, Registry, TextEncoder};
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use prometheus::{register_counter_vec, register_gauge_vec, register_histogram_vec, CounterVec, GaugeVec, HistogramVec, Opts, TextEncoder};
 
 use crate::error::{Error, Result};
 use crate::log::Log;
@@ -234,13 +231,10 @@ impl MetricsInterface for PrometheusMetricsDriver {
     async fn get_metrics_as_plaintext(&self) -> String {
         let encoder = TextEncoder::new();
         let metric_families = prometheus::gather(); // Gather from the default registry
-        match encoder.encode_to_string(&metric_families) {
-            Ok(metrics) => metrics,
-            Err(e) => {
-                Log::error(format!("Failed to encode metrics to string: {}", e));
-                String::from("Error encoding metrics")
-            }
-        }
+        encoder.encode_to_string(&metric_families).unwrap_or_else(|e| {
+            Log::error(format!("Failed to encode metrics to string: {}", e));
+            String::from("Error encoding metrics")
+        })
     }
 
     async fn clear(&self) {

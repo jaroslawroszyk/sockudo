@@ -36,7 +36,7 @@ impl AuthValidator {
         user_data: &str,
         auth: &str,
     ) -> Result<bool, Error> {
-        let app = self.app_manager.get_app(app_key).await.unwrap();
+        let app = self.app_manager.get_app(app_key).await?;
         if app.is_none() {
             return Err(Error::InvalidAppKey);
         }

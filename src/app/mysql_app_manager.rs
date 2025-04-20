@@ -9,6 +9,8 @@ use dashmap::DashMap;
 use sqlx::{mysql::MySqlPoolOptions, MySqlPool};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use futures_util::{stream, StreamExt};
+use moka::future::Cache;
 use tokio::sync::Mutex;
 use tokio::time::interval;
 
@@ -24,6 +26,7 @@ pub struct MySQLConfig {
     pub connection_pool_size: u32,
     pub cache_ttl: u64,              // in seconds
     pub cache_cleanup_interval: u64, // in seconds
+    pub cache_max_capacity: u64,
 }
 
 impl Default for MySQLConfig {
@@ -38,6 +41,7 @@ impl Default for MySQLConfig {
             connection_pool_size: 10,
             cache_ttl: 300,             // 5 minutes
             cache_cleanup_interval: 60, // 1 minute
+            cache_max_capacity: 100,
         }
     }
 }
@@ -46,7 +50,7 @@ impl Default for MySQLConfig {
 pub struct MySQLAppManager {
     config: MySQLConfig,
     pool: MySqlPool,
-    cache: Arc<DashMap<String, (Arc<App>, Instant)>>, // Store Arc<App> directly
+    app_cache: Cache<String, App>, // App ID -> App
 }
 
 impl MySQLAppManager {
@@ -74,66 +78,21 @@ impl MySQLAppManager {
             .map_err(|e| Error::InternalError(format!("Failed to connect to MySQL: {}", e)))?;
 
         // Initialize cache
-        let cache = Arc::new(DashMap::new());
+        let app_cache = Cache::builder()
+            .time_to_live(Duration::from_secs(config.cache_ttl))
+            .max_capacity(config.cache_max_capacity)
+            // Add other options like time_to_idle if needed
+            .build();
 
-        // Create the manager instance
         let manager = Self {
             config,
             pool,
-            cache,
+            app_cache,
         };
 
-        // Create table if it doesn't exist
         manager.ensure_table_exists().await?;
 
-        // Start cache cleanup task
-        manager.start_cache_cleanup();
-
         Ok(manager)
-    }
-
-    /// Start a background task to clean up expired cache entries
-    fn start_cache_cleanup(&self) {
-        let cache = self.cache.clone();
-        let ttl = self.config.cache_ttl;
-        let interval_secs = self.config.cache_cleanup_interval;
-
-        tokio::spawn(async move {
-            let mut interval_timer = interval(Duration::from_secs(interval_secs));
-
-            loop {
-                interval_timer.tick().await;
-                Log::info("Running AppManager cache cleanup task");
-
-                // Get current time
-                let now = Instant::now();
-
-                // Collect keys to remove
-                let expired_keys: Vec<String> = cache
-                    .iter()
-                    .filter_map(|entry| {
-                        let (key, (_, timestamp)) = (entry.key().clone(), entry.value());
-                        if now.duration_since(*timestamp).as_secs() > ttl {
-                            Some(key)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                // Remove expired entries
-                for key in &expired_keys {
-                    cache.remove(key);
-                }
-
-                if !expired_keys.is_empty() {
-                    Log::info(format!(
-                        "Removed {} expired cache entries",
-                        expired_keys.len()
-                    ));
-                }
-            }
-        });
     }
 
     /// Create the applications table if it doesn't exist
@@ -180,15 +139,10 @@ impl MySQLAppManager {
     }
 
     /// Get an app by ID from cache or database
-    pub async fn get_app(&self, app_id: &str) -> Result<Option<Arc<App>>> {
+    pub async fn get_app(&self, app_id: &str) -> Result<Option<App>> {
         // Try to get from cache first
-        if let Some(cached) = self.cache.get(app_id) {
-            let (app, timestamp) = cached.value();
-            // Check if cache entry is still valid
-            if Instant::now().duration_since(*timestamp).as_secs() < self.config.cache_ttl {
-                return Ok(Some(app.clone()));
-            }
-            // Cache entry expired, it will be removed in the next cleanup cycle
+        if let Some(app) = self.app_cache.get(app_id).await {
+            return Ok(Some(app))
         }
 
         // Not in cache or expired, fetch from database
@@ -229,11 +183,11 @@ impl MySQLAppManager {
 
         if let Some(app_row) = app_result {
             // Convert to App
-            let app = Arc::new(app_row.into_app());
+            let app = app_row.into_app();
 
             // Update cache
-            self.cache
-                .insert(app_id.to_string(), (app.clone(), Instant::now()));
+            self.app_cache
+                .insert(app_id.to_string(), app.clone()).await;
 
             Ok(Some(app))
         } else {
@@ -244,11 +198,8 @@ impl MySQLAppManager {
     /// Get an app by key from cache or database
     pub async fn get_app_by_key(&self, key: &str) -> Result<Option<App>> {
         // Check cache first
-        for entry in self.cache.iter() {
-            let (app, _) = entry.value();
-            if app.key == key {
-                return Ok(Some((**app).clone()));
-            }
+        if let Some(app) = self.app_cache.get(key).await {
+            return Ok(Some(app))
         }
 
         // Not found in cache, query database
@@ -290,10 +241,9 @@ impl MySQLAppManager {
 
             // Update cache with this app
             let app_id = app.id.clone();
-            let app_arc = Arc::new(app.clone());
-            self.cache.insert(app_id, (app_arc, Instant::now()));
+            self.app_cache.insert(app_id, app.clone()).await;
 
-            Ok(Some(app))
+            Ok(Some(app.clone().into()))
         } else {
             Ok(None)
         }
@@ -341,10 +291,9 @@ impl MySQLAppManager {
                 Error::InternalError(format!("Failed to insert app into MySQL: {}", e))
             })?;
 
-        // Update cache
-        let app_arc = Arc::new(app);
-        self.cache
-            .insert(app_arc.id.clone(), (app_arc, Instant::now()));
+        // Update cach
+        self.app_cache
+            .insert(app.id.clone(), app).await;
 
         Ok(())
     }
@@ -396,9 +345,8 @@ impl MySQLAppManager {
         }
 
         // Update cache
-        let app_arc = Arc::new(app);
-        self.cache
-            .insert(app_arc.id.clone(), (app_arc, Instant::now()));
+        self.app_cache
+            .insert(app.id.clone(), app).await;
 
         Ok(())
     }
@@ -424,7 +372,7 @@ impl MySQLAppManager {
         }
 
         // Remove from cache
-        self.cache.remove(app_id);
+        self.app_cache.remove(app_id).await;
 
         Ok(())
     }
@@ -433,46 +381,64 @@ impl MySQLAppManager {
     pub async fn get_apps(&self) -> Result<Vec<App>> {
         Log::info("Fetching all apps from database");
 
-        // Prepare the query with proper table name
         let query = format!(
             r#"SELECT
-                id, `key`, secret, max_connections,
-                enable_client_messages, enabled,
-                max_backend_events_per_second,
-                max_client_events_per_second,
-                max_read_requests_per_second,
-                max_presence_members_per_channel,
-                max_presence_member_size_in_kb,
-                max_channel_name_length,
-                max_event_channels_at_once,
-                max_event_name_length,
-                max_event_payload_in_kb,
-                max_event_batch_size,
-                enable_user_authentication
-            FROM `{}`"#,
-            self.config.table_name
+            id, `key`, secret, max_connections,
+            enable_client_messages, enabled,
+            max_backend_events_per_second,
+            max_client_events_per_second,
+            max_read_requests_per_second,
+            max_presence_members_per_channel,
+            max_presence_member_size_in_kb,
+            max_channel_name_length,
+            max_event_channels_at_once,
+            max_event_name_length,
+            max_event_payload_in_kb,
+            max_event_batch_size,
+            enable_user_authentication
+        FROM `{}`"#,
+            self.config.table_name // Ensure config.table_name is safely handled
         );
 
-        let app_rows = sqlx::query_as::<_, AppRow>(&query)
+        // Fetch all rows from the database
+        let app_rows = sqlx::query_as::<_, AppRow>(&query) // Ensure AppRow derives FromRow
             .fetch_all(&self.pool)
             .await
             .map_err(|e| {
                 Log::error(format!("Database error fetching all apps: {}", e));
+                // Consider a more specific error type if possible
                 Error::InternalError(format!("Failed to fetch apps from MySQL: {}", e))
             })?;
 
-        // Convert rows to App objects and update cache
-        let now = Instant::now();
-        let apps: Vec<App> = app_rows
-            .into_iter()
-            .map(|row| {
-                let app = row.into_app();
-                let app_id = app.id.clone();
-                let app_arc = Arc::new(app.clone());
-                self.cache.insert(app_id, (app_arc, now));
+        Log::warning(format!("Fetched {} app rows from database.", app_rows.len()));
+
+        // Process rows concurrently using streams:
+        // 1. Convert iterator to stream
+        // 2. Map each row to an async block that converts, caches, and returns the App
+        // 3. Buffer the async operations for concurrency
+        // 4. Collect the results (Apps) into a Vec
+        let apps = stream::iter(app_rows)
+            .map(|row| async {
+                let app = row.into_app(); // Convert row to App struct
+                let app_arc = Arc::new(app.clone()); // Create Arc for caching
+
+                // Insert the Arc<App> into the cache
+                // Note: insert takes key by value, so clone app_arc.id
+                self.app_cache.insert(app_arc.id.clone(), app.clone()).await;
+
+                // Return the owned App for the final Vec<App>
                 app
             })
-            .collect();
+            // Execute up to N futures concurrently (e.g., based on pool size)
+            // Adjust buffer size as needed. Using connection_pool_size might be reasonable.
+            .buffer_unordered(self.config.connection_pool_size as usize)
+            .collect::<Vec<App>>() // Collect the resulting Apps
+            .await; // Await the stream processing
+
+        Log::info(format!(
+            "Finished processing and caching {} apps.",
+            apps.len()
+        ));
 
         Ok(apps)
     }
@@ -557,7 +523,7 @@ impl MySQLAppManager {
         let string_to_sign = format!("{}::user::{}", socket_id, signature);
 
         // Generate token
-        let token = Token::new(app.key, app.secret);
+        let token = Token::new(app.key.clone(), app.secret.clone());
 
         // Verify
         Ok(token.verify(&string_to_sign, &signature))
@@ -607,6 +573,7 @@ impl AppRow {
             max_event_payload_in_kb: self.max_event_payload_in_kb,
             max_event_batch_size: self.max_event_batch_size,
             enable_user_authentication: self.enable_user_authentication,
+            webhooks: None, // Assuming webhooks are not part of the App struct
         }
     }
 }
@@ -654,7 +621,7 @@ impl AppManager for MySQLAppManager {
         // For the sync interface, poll the async function in a blocking manner
         self.get_app(app_id)
             .await
-            .map(|app| app.map(|a| (*a).clone()))
+            .map(|app| app.map(|a| a.clone()))
     }
 
     async fn get_app_by_key(&self, key: &str) -> Result<Option<App>> {
@@ -692,7 +659,7 @@ impl Clone for MySQLAppManager {
         Self {
             config: self.config.clone(),
             pool: self.pool.clone(),
-            cache: self.cache.clone(),
+            app_cache: self.app_cache.clone()
         }
     }
 }
@@ -723,6 +690,7 @@ mod tests {
             max_event_payload_in_kb: Some(100),
             max_event_batch_size: Some(10),
             enable_user_authentication: Some(true),
+            webhooks: None,
         }
     }
 

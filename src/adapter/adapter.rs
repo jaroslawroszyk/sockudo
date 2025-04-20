@@ -100,4 +100,8 @@ pub trait Adapter: Send + Sync {
     async fn terminate_user_connections(&mut self, app_id: &str, user_id: &str) -> Result<()>;
     async fn add_user(&mut self, ws: Arc<Mutex<WebSocket>>) -> Result<()>;
     async fn remove_user(&mut self, ws: Arc<Mutex<WebSocket>>) -> Result<()>;
+    async fn get_channels_with_socket_count(
+        &mut self,
+        app_id: &str,
+    ) -> Result<DashMap<String, usize>>;
 }
