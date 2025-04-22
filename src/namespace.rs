@@ -97,7 +97,8 @@ impl Namespace {
         let connection_arc = Arc::new(Mutex::new(connection));
 
         // Store the connection in the central map.
-        self.sockets.insert(socket_id.clone(), connection_arc.clone());
+        self.sockets
+            .insert(socket_id.clone(), connection_arc.clone());
 
         // Spawn a dedicated task to handle sending messages from the channel to the WebSocket client.
         // This decouples message sending logic from the rest of the application.
@@ -138,7 +139,9 @@ impl Namespace {
     // Retrieves a connection Arc by SocketId.
     pub fn get_connection(&self, socket_id: &SocketId) -> Option<Arc<Mutex<WebSocket>>> {
         // `DashMap::get` returns a Ref, clone the value (Arc) out of it.
-        self.sockets.get(socket_id).map(|conn_ref| conn_ref.value().clone())
+        self.sockets
+            .get(socket_id)
+            .map(|conn_ref| conn_ref.value().clone())
     }
 
     // Retrieves a connection Arc if it exists and is subscribed to the specified channel.
@@ -168,14 +171,14 @@ impl Namespace {
             // Lock the connection briefly to access the message sender channel.
             // Note: Locking is necessary because the sender is inside the Mutex-protected WebSocket.
             let conn_guard = connection.lock().await;
-            conn_guard
-                .message_sender
-                .send(frame)
-                .map_err(|e| {
-                    // If send fails, the receiver task likely terminated (connection closed).
-                    Log::warning(format!("Failed to queue message for {}: {}", socket_id, e));
-                    Error::ConnectionError(format!("Failed to send message: receiver closed for {}", socket_id))
-                })?;
+            conn_guard.message_sender.send(frame).map_err(|e| {
+                // If send fails, the receiver task likely terminated (connection closed).
+                Log::warning(format!("Failed to queue message for {}: {}", socket_id, e));
+                Error::ConnectionError(format!(
+                    "Failed to send message: receiver closed for {}",
+                    socket_id
+                ))
+            })?;
         } else {
             // Log if the target socket doesn't exist (it might have disconnected).
             Log::warning(format!(
@@ -261,10 +264,14 @@ impl Namespace {
             for socket_id in socket_ids.iter() {
                 if let Some(connection) = self.get_connection(&socket_id) {
                     // Lock the connection state briefly to clone presence data.
-                    let presence_data = { // Scoped lock
+                    let presence_data = {
+                        // Scoped lock
                         let conn_guard = connection.lock().await;
                         // Clone only the presence map for this specific channel, if it exists.
-                        conn_guard.state.presence.as_ref()
+                        conn_guard
+                            .state
+                            .presence
+                            .as_ref()
                             .and_then(|p_map| p_map.get(channel).cloned())
                     }; // Lock guard dropped here
 
@@ -279,7 +286,10 @@ impl Namespace {
             }
         } else {
             // Channel doesn't exist, return empty map.
-            Log::info(format!("get_channel_members called on non-existent channel: {}", channel));
+            Log::info(format!(
+                "get_channel_members called on non-existent channel: {}",
+                channel
+            ));
         }
 
         Ok(presence_members)
@@ -353,7 +363,10 @@ impl Namespace {
         let error_payload = match serde_json::to_string(&disconnect_message) {
             Ok(payload) => Some(payload),
             Err(e) => {
-                Log::error(format!("Failed to serialize disconnect message for {}: {}", socket_id, e));
+                Log::error(format!(
+                    "Failed to serialize disconnect message for {}: {}",
+                    socket_id, e
+                ));
                 None
             }
         };
@@ -385,7 +398,10 @@ impl Namespace {
         let user_id_option = {
             let ws_guard = ws_ref.0.lock().await;
             // Safely get user ID string if user data exists.
-            ws_guard.state.user.as_ref()
+            ws_guard
+                .state
+                .user
+                .as_ref()
                 .and_then(|u| u.get("id"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()) // Clone the user ID string
@@ -413,10 +429,12 @@ impl Namespace {
         if self.sockets.remove(&socket_id).is_some() {
             Log::info(format!("Removed socket {} from main map.", socket_id));
         } else {
-            Log::warning(format!("Socket {} already removed from main map during cleanup.", socket_id));
+            Log::warning(format!(
+                "Socket {} already removed from main map during cleanup.",
+                socket_id
+            ));
         }
     }
-
 
     // Terminates all connections associated with a specific user ID.
     pub async fn terminate_user_connections(&self, user_id: &str) -> Result<()> {
@@ -427,15 +445,18 @@ impl Namespace {
             None => DashSet::new(), // No connections for this user.
         };
 
-
         if connections_to_terminate.is_empty() {
-            Log::info(format!("No active connections found to terminate for user: {}", user_id));
+            Log::info(format!(
+                "No active connections found to terminate for user: {}",
+                user_id
+            ));
             return Ok(());
         }
 
         Log::info(format!(
             "Terminating {} connections for user: {}",
-            connections_to_terminate.len(), user_id
+            connections_to_terminate.len(),
+            user_id
         ));
 
         // Create futures for cleaning up each connection concurrently.
@@ -448,7 +469,10 @@ impl Namespace {
         // Wait for all cleanup tasks to complete.
         join_all(cleanup_futures).await;
 
-        Log::info(format!("Finished terminating connections for user: {}", user_id));
+        Log::info(format!(
+            "Finished terminating connections for user: {}",
+            user_id
+        ));
 
         // Note: The user entry in `self.users` might still exist briefly if cleanup_connection
         // hasn't removed it yet, but it should be removed shortly after by those tasks.
@@ -512,7 +536,6 @@ impl Namespace {
         self.channels.get(channel).map(|set_ref| set_ref.clone())
     }
 
-
     // Removes a channel entry entirely, regardless of subscribers.
     pub fn remove_channel(&self, channel: &str) {
         self.channels.remove(channel);
@@ -524,7 +547,8 @@ impl Namespace {
     pub fn is_in_channel(&self, channel: &str, socket_id: &SocketId) -> bool {
         self.channels
             .get(channel) // Get read-only reference to the set.
-            .map_or(false, |channel_sockets| channel_sockets.contains(socket_id)) // Check containment.
+            .map_or(false, |channel_sockets| channel_sockets.contains(socket_id))
+        // Check containment.
     }
 
     // Retrieves presence information for a specific socket within a channel.
@@ -538,7 +562,10 @@ impl Namespace {
             // Lock the state briefly.
             let conn_guard = connection.lock().await;
             // Safely access presence data, clone if found for the specific channel.
-            conn_guard.state.presence.as_ref() // Option<&HashMap>
+            conn_guard
+                .state
+                .presence
+                .as_ref() // Option<&HashMap>
                 .and_then(|presence_map| presence_map.get(channel)) // Option<&PresenceMemberInfo>
                 .cloned() // Option<PresenceMemberInfo>
         } else {
@@ -551,7 +578,8 @@ impl Namespace {
     // Safely handles JSON access.
     pub async fn add_user(&self, ws: Arc<Mutex<WebSocket>>) -> Result<()> {
         // Clone the user data (Option<serde_json::Value>) from the WebSocket state.
-        let user_json_option = { // Scoped lock
+        let user_json_option = {
+            // Scoped lock
             let ws_guard = ws.lock().await;
             ws_guard.state.user.clone()
         };
@@ -560,13 +588,16 @@ impl Namespace {
             // Safely extract the user ID as a string.
             if let Some(user_id_str) = user_val.get("id").and_then(|v| v.as_str()) {
                 let user_id = user_id_str.to_string(); // Clone the string slice
-                // Get or create the DashSet for this user ID.
+                                                       // Get or create the DashSet for this user ID.
                 let mut user_sockets_ref = self.users.entry(user_id.clone()).or_default();
                 // Add the WebSocket reference (assuming WebSocketRef wraps the Arc).
                 // Requires WebSocketRef to implement Clone, Eq, Hash.
                 user_sockets_ref.insert(WebSocketRef(ws.clone())); // Assuming WebSocketRef(Arc<Mutex<WebSocket>>)
-                Log::info(format!("Added socket {} to user {}", ws.lock().await.state.socket_id, user_id));
-
+                Log::info(format!(
+                    "Added socket {} to user {}",
+                    ws.lock().await.state.socket_id,
+                    user_id
+                ));
             } else {
                 // Log if user data is present but lacks a valid 'id' field.
                 Log::warning(format!(
@@ -585,9 +616,13 @@ impl Namespace {
     // Safely handles JSON access.
     pub async fn remove_user(&self, ws: Arc<Mutex<WebSocket>>) -> Result<()> {
         // Clone user data and get socket ID within a single lock if possible.
-        let (user_json_option, socket_id) = { // Scoped lock
+        let (user_json_option, socket_id) = {
+            // Scoped lock
             let ws_guard = ws.lock().await;
-            (ws_guard.state.user.clone(), ws_guard.state.socket_id.clone())
+            (
+                ws_guard.state.user.clone(),
+                ws_guard.state.socket_id.clone(),
+            )
         };
 
         if let Some(user_val) = user_json_option {
@@ -602,7 +637,10 @@ impl Namespace {
                     drop(user_sockets_ref);
 
                     if removed.is_some() {
-                        Log::info(format!("Removed socket {} from user {}", socket_id, user_id_str));
+                        Log::info(format!(
+                            "Removed socket {} from user {}",
+                            socket_id, user_id_str
+                        ));
                     }
 
                     // If the set becomes empty, remove the user entry from the map.
@@ -624,9 +662,7 @@ impl Namespace {
     }
 
     // Retrieves a map of channel names to their current subscriber counts.
-    pub async fn get_channels_with_socket_count(
-        &self
-    ) -> Result<DashMap<String, usize>> {
+    pub async fn get_channels_with_socket_count(&self) -> Result<DashMap<String, usize>> {
         // Create a new DashMap to store the results.
         let channels_with_count: DashMap<String, usize> = DashMap::new();
         // Iterate over the channels map. `iter` provides read-only access.

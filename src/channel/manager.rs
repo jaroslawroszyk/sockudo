@@ -76,9 +76,7 @@ impl ChannelManager {
             .is_in_channel(app_id, channel_name, &socket_id)
             .await?
         {
-            let channel = connection_manager
-                .get_channel(app_id, channel_name)
-                .await?;
+            let channel = connection_manager.get_channel(app_id, channel_name).await?;
 
             return Ok(JoinResponse {
                 success: true,
@@ -261,5 +259,14 @@ impl ChannelManager {
             }
             _ => panic!("Invalid message data"),
         }
+    }
+    
+    pub async fn get_channel_members(
+        &self,
+        app_id: &str,
+        channel: &str,
+    ) -> Result<HashMap<String, PresenceMemberInfo>, Error> {
+        let mut connection_manager = self.connection_manager.lock().await;
+        connection_manager.get_channel_members(app_id, channel).await
     }
 }

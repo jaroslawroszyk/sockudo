@@ -5,6 +5,7 @@ use crate::app::manager::AppManager;
 use crate::cache::manager::CacheManager;
 use crate::channel::{ChannelType, PresenceMemberInfo};
 use crate::log::Log;
+use crate::metrics::MetricsInterface;
 use crate::protocol::messages::{ErrorData, MessageData, PusherApiMessage, PusherMessage};
 use crate::websocket::{SocketId, WebSocketRef};
 use crate::{
@@ -17,7 +18,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
-use crate::metrics::MetricsInterface;
 
 pub struct ConnectionHandler {
     pub(crate) app_manager: Arc<dyn AppManager + Send + Sync>,
@@ -69,7 +69,12 @@ impl ConnectionHandler {
         Ok(())
     }
 
-    pub async fn handle_socket(&self, fut: upgrade::UpgradeFut, app_key: String, metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>) -> Result<()> {
+    pub async fn handle_socket(
+        &self,
+        fut: upgrade::UpgradeFut,
+        app_key: String,
+        metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>,
+    ) -> Result<()> {
         // Get app by key - this needs to handle both sync and potentially async implementations
         let app = self.app_manager.get_app_by_key(&app_key).await?;
         if app.is_none() {
@@ -97,13 +102,9 @@ impl ConnectionHandler {
                     Log::error(format!("Failed to add socket: {}", e));
                     WebSocketError::ConnectionClosed
                 })?;
-            match self.metrics {
-                Some(ref metrics) => {
-                    let mut metrics = metrics.lock().await;
-                    metrics
-                        .mark_new_connection(&app.id, &socket_id)
-                }
-                None => {}
+            if let Some(ref metrics) = self.metrics {
+                let metrics = metrics.lock().await;
+                metrics.mark_new_connection(&app.id, &socket_id)
             }
         }
 
@@ -217,6 +218,15 @@ impl ConnectionHandler {
                 "Failed to handle event: {}, error: {}",
                 event, e
             )));
+        }
+        
+        if let Some(ref metrics) = self.metrics {
+            let mut metrics = metrics.lock().await;
+            let message_size = frame.payload.len();
+            metrics.mark_ws_message_received(
+                &app.id,
+               message_size
+            );
         }
 
         Ok(())
@@ -661,11 +671,7 @@ impl ConnectionHandler {
         };
 
         // Verify client events are enabled
-        if !self
-            .app_manager
-            .can_handle_client_events(&app_key)
-            .await?
-        {
+        if !self.app_manager.can_handle_client_events(&app_key).await? {
             return Err(Error::ClientEventError(
                 "Client events are not enabled for this app".into(),
             ));
@@ -871,7 +877,9 @@ impl ConnectionHandler {
 
     pub async fn channels(&self, app_id: &str) -> Value {
         let mut connection_manager = self.connection_manager.lock().await;
-        let channels = connection_manager.get_channels_with_socket_count(app_id).await;
+        let channels = connection_manager
+            .get_channels_with_socket_count(app_id)
+            .await;
         let mut response = json!({});
         channels.unwrap().iter_mut().for_each(|channel| {
             let channel_name = channel.key().clone();
@@ -882,7 +890,23 @@ impl ConnectionHandler {
             });
         });
         response
-        
+    }
+
+    pub async fn channel_users(
+        &self,
+        app_id: &str,
+        channel_name: &str,
+    ) -> Result<HashMap<String, PresenceMemberInfo>> {
+        // see if current channel is presence
+        let channel_type = ChannelType::from_name(channel_name);
+        if channel_type != ChannelType::Presence {
+            return Err(Error::ChannelError("Channel is not a presence channel".into()));
+        }
+        let channel_manager = self.channel_manager.read().await;
+        let members = channel_manager
+            .get_channel_members(app_id, channel_name)
+            .await?;
+        Ok(members)
     }
 
     pub async fn send_message(

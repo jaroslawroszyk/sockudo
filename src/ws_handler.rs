@@ -1,10 +1,17 @@
 use crate::adapter::ConnectionHandler;
-use crate::ConnectionQuery;
+use crate::log::Log;
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use fastwebsockets::upgrade;
+use serde::Deserialize;
 use std::sync::Arc;
-use crate::log::Log;
+
+#[derive(Debug, Deserialize)]
+pub struct ConnectionQuery {
+    protocol: Option<u8>,
+    client: Option<String>,
+    version: Option<String>,
+}
 
 // WebSocket upgrade handler
 pub async fn handle_ws_upgrade(
@@ -15,6 +22,8 @@ pub async fn handle_ws_upgrade(
 ) -> impl IntoResponse {
     let (response, fut) = ws.upgrade().unwrap();
     let metrics = handler.metrics.clone();
+    let apps = handler.app_manager.get_apps().await;
+    println!("{:?}", apps.unwrap());
     tokio::task::spawn(async move {
         if let Err(e) = handler.handle_socket(fut, app_key, metrics).await {
             Log::error(format!("Error handling socket: {}", e));

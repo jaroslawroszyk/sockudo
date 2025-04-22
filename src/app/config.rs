@@ -1,6 +1,6 @@
+use crate::webhook::types::Webhook;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::webhook::types::Webhook;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct App {

@@ -23,7 +23,7 @@ pub enum RequestType {
     ChannelSocketsCount,
     SocketExistsInChannel,
     TerminateUserConnections,
-    ChannelsWithSocketsCount
+    ChannelsWithSocketsCount,
 }
 
 /// Request body for horizontal communication
@@ -208,7 +208,7 @@ impl HorizontalAdapter {
                         .await;
                     response.exists = true;
                 }
-            },
+            }
             RequestType::ChannelsWithSocketsCount => {
                 if let Some(channel) = &request.channel {
                     // Get channels with socket count from local adapter
@@ -320,7 +320,8 @@ impl HorizontalAdapter {
         // Get all responses
         if let Some((_, request)) = self.pending_requests.remove(&request_id) {
             // Combine the results
-            for response in request.responses {  // Also note it's "responses" not "response"
+            for response in request.responses {
+                // Also note it's "responses" not "response"
                 // Add members
                 combined_response.members.extend(response.members);
 

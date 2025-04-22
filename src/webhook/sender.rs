@@ -1,19 +1,19 @@
-use hmac::KeyInit;
 use crate::app::config::App;
 use crate::channel::ChannelType;
 use crate::error::Result;
 use crate::log::Log;
 use crate::token::Token;
 use crate::webhook::queue::QueueManager;
-use crate::webhook::types::{ClientEventData, JobData, JobPayload, WebhookEvent, AppWebhook};
+use crate::webhook::types::{AppWebhook, ClientEventData, JobData, JobPayload, WebhookEvent};
+use async_trait::async_trait;
+use hmac::KeyInit;
 use hmac::{Hmac, Mac};
-use reqwest::Client as HttpClient;
 use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::Client as HttpClient;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
@@ -24,7 +24,7 @@ pub struct WebhookSenderConfig {
     pub process_id: String,
     pub debug: bool,
     pub batching_enabled: bool,
-    pub batching_duration: u64,  // milliseconds
+    pub batching_duration: u64, // milliseconds
     pub can_process_queues: bool,
 }
 
@@ -81,12 +81,18 @@ impl WebhookSender {
     /// Initialize queue processors for webhook types
     async fn initialize_queue_processors(&self) {
         // Setup queue processors for the different webhook types
-        self.setup_queue_processor(WebhookEvent::ClientEvent.to_queue_name()).await;
-        self.setup_queue_processor(WebhookEvent::ChannelOccupied.to_queue_name()).await;
-        self.setup_queue_processor(WebhookEvent::ChannelVacated.to_queue_name()).await;
-        self.setup_queue_processor(WebhookEvent::MemberAdded.to_queue_name()).await;
-        self.setup_queue_processor(WebhookEvent::MemberRemoved.to_queue_name()).await;
-        self.setup_queue_processor(WebhookEvent::CacheMiss.to_queue_name()).await;
+        self.setup_queue_processor(WebhookEvent::ClientEvent.to_queue_name())
+            .await;
+        self.setup_queue_processor(WebhookEvent::ChannelOccupied.to_queue_name())
+            .await;
+        self.setup_queue_processor(WebhookEvent::ChannelVacated.to_queue_name())
+            .await;
+        self.setup_queue_processor(WebhookEvent::MemberAdded.to_queue_name())
+            .await;
+        self.setup_queue_processor(WebhookEvent::MemberRemoved.to_queue_name())
+            .await;
+        self.setup_queue_processor(WebhookEvent::CacheMiss.to_queue_name())
+            .await;
     }
 
     /// Setup a queue processor for a specific webhook type
@@ -113,7 +119,8 @@ impl WebhookSender {
             // For now, we'll just mock sending the webhook
 
             // Create signature for verification
-            let signature = create_webhook_hmac(&serde_json::to_string(&payload).unwrap(), "app_secret");
+            let signature =
+                create_webhook_hmac(&serde_json::to_string(&payload).unwrap(), "app_secret");
             if signature != original_signature {
                 // Signature mismatch, potential tampering
                 if debug {
@@ -125,20 +132,37 @@ impl WebhookSender {
             // Mock sending to webhook URL
             if debug {
                 Log::webhook_sender_title("✅ Webhook processed (mock)");
-                Log::webhook_sender(format!("Would send webhook to URL with payload: {:?}", payload));
+                Log::webhook_sender(format!(
+                    "Would send webhook to URL with payload: {:?}",
+                    payload
+                ));
             }
 
             Ok(())
         });
 
         // Register the processor with the queue
-        self.queue_manager.process_queue(queue_name, processor).await.ok();
+        self.queue_manager
+            .process_queue(queue_name, processor)
+            .await
+            .ok();
 
-        Log::info(format!("Initialized webhook queue processor for {}", queue_name));
+        Log::info(format!(
+            "Initialized webhook queue processor for {}",
+            queue_name
+        ));
     }
 
     /// Send a client event webhook
-    pub async fn send_client_event(&self, app: &App, channel: &str, event: &str, data: serde_json::Value, socket_id: Option<&str>, user_id: Option<&str>) -> Result<()> {
+    pub async fn send_client_event(
+        &self,
+        app: &App,
+        channel: &str,
+        event: &str,
+        data: serde_json::Value,
+        socket_id: Option<&str>,
+        user_id: Option<&str>,
+    ) -> Result<()> {
         if !app.has_client_event_webhooks() {
             return Ok(());
         }
@@ -160,7 +184,8 @@ impl WebhookSender {
             }
         }
 
-        self.send(app, event_data, WebhookEvent::ClientEvent.to_queue_name()).await
+        self.send(app, event_data, WebhookEvent::ClientEvent.to_queue_name())
+            .await
     }
 
     /// Send a channel occupied webhook
@@ -179,7 +204,12 @@ impl WebhookSender {
             time_ms: None,
         };
 
-        self.send(app, event_data, WebhookEvent::ChannelOccupied.to_queue_name()).await
+        self.send(
+            app,
+            event_data,
+            WebhookEvent::ChannelOccupied.to_queue_name(),
+        )
+        .await
     }
 
     /// Send a channel vacated webhook
@@ -198,7 +228,12 @@ impl WebhookSender {
             time_ms: None,
         };
 
-        self.send(app, event_data, WebhookEvent::ChannelVacated.to_queue_name()).await
+        self.send(
+            app,
+            event_data,
+            WebhookEvent::ChannelVacated.to_queue_name(),
+        )
+        .await
     }
 
     /// Send a member added webhook
@@ -217,7 +252,8 @@ impl WebhookSender {
             time_ms: None,
         };
 
-        self.send(app, event_data, WebhookEvent::MemberAdded.to_queue_name()).await
+        self.send(app, event_data, WebhookEvent::MemberAdded.to_queue_name())
+            .await
     }
 
     /// Send a member removed webhook
@@ -236,7 +272,8 @@ impl WebhookSender {
             time_ms: None,
         };
 
-        self.send(app, event_data, WebhookEvent::MemberRemoved.to_queue_name()).await
+        self.send(app, event_data, WebhookEvent::MemberRemoved.to_queue_name())
+            .await
     }
 
     /// Send a cache miss webhook
@@ -255,7 +292,8 @@ impl WebhookSender {
             time_ms: None,
         };
 
-        self.send(app, event_data, WebhookEvent::CacheMiss.to_queue_name()).await
+        self.send(app, event_data, WebhookEvent::CacheMiss.to_queue_name())
+            .await
     }
 
     /// Send webhook with appropriate batching strategy
@@ -268,7 +306,12 @@ impl WebhookSender {
     }
 
     /// Send a batch of webhook events without batching
-    async fn send_webhook(&self, app: &App, events: Vec<ClientEventData>, queue_name: &str) -> Result<()> {
+    async fn send_webhook(
+        &self,
+        app: &App,
+        events: Vec<ClientEventData>,
+        queue_name: &str,
+    ) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -279,10 +322,7 @@ impl WebhookSender {
             .unwrap_or_else(|_| Duration::from_secs(0))
             .as_millis() as u64;
 
-        let payload = JobPayload {
-            time_ms,
-            events,
-        };
+        let payload = JobPayload { time_ms, events };
 
         // Create HMAC signature for payload
         let payload_json = serde_json::to_string(&payload)?;
@@ -296,7 +336,9 @@ impl WebhookSender {
         };
 
         // Add to queue for processing
-        self.queue_manager.add_to_queue(queue_name, job_data).await?;
+        self.queue_manager
+            .add_to_queue(queue_name, job_data)
+            .await?;
 
         if self.config.debug {
             Log::webhook_sender_title(format!("Added webhook event to {} queue", queue_name));
@@ -306,11 +348,17 @@ impl WebhookSender {
     }
 
     /// Send a webhook with batching support
-    async fn send_webhook_by_batching(&self, app: &App, data: ClientEventData, queue_name: &str) -> Result<()> {
+    async fn send_webhook_by_batching(
+        &self,
+        app: &App,
+        data: ClientEventData,
+        queue_name: &str,
+    ) -> Result<()> {
         // Add event to batch
         {
             let mut batches = self.batch.lock().await;
-            let batch = batches.entry(queue_name.to_string())
+            let batch = batches
+                .entry(queue_name.to_string())
                 .or_insert_with(Vec::new);
             batch.push(data);
         }
@@ -369,10 +417,7 @@ impl WebhookSender {
                         .unwrap_or_else(|_| Duration::from_secs(0))
                         .as_millis() as u64;
 
-                    let payload = JobPayload {
-                        time_ms,
-                        events,
-                    };
+                    let payload = JobPayload { time_ms, events };
 
                     // Create HMAC signature for payload
                     let payload_json = serde_json::to_string(&payload).unwrap_or_default();
@@ -386,11 +431,16 @@ impl WebhookSender {
                     };
 
                     // Add to queue for processing
-                    let _ = queue_manager.add_to_queue(&queue_name, job_data.clone()).await;
+                    let _ = queue_manager
+                        .add_to_queue(&queue_name, job_data.clone())
+                        .await;
 
                     if debug {
-                        Log::webhook_sender_title(format!("Batched {} webhook events sent to {} queue",
-                                                        job_data.payload.events.len(), queue_name));
+                        Log::webhook_sender_title(format!(
+                            "Batched {} webhook events sent to {} queue",
+                            job_data.payload.events.len(),
+                            queue_name
+                        ));
                     }
                 }
             });
@@ -402,8 +452,8 @@ impl WebhookSender {
 
 /// Create HMAC-SHA256 signature for webhook payload
 pub fn create_webhook_hmac(data: &str, secret: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .expect("HMAC can take key of any size");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
 
     mac.update(data.as_bytes());
 

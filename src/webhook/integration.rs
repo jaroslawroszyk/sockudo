@@ -72,7 +72,8 @@ impl WebhookIntegration {
             config.redis_url.as_deref(),
             config.redis_prefix.as_deref(),
             config.redis_concurrency,
-        ).await?;
+        )
+        .await?;
 
         // Create webhook sender
         let sender_config = WebhookSenderConfig {
@@ -100,9 +101,19 @@ impl WebhookIntegration {
     }
 
     /// Send a client event webhook
-    pub async fn send_client_event(&self, app: &App, channel: &str, event: &str, data: serde_json::Value, socket_id: Option<&str>, user_id: Option<&str>) -> Result<()> {
+    pub async fn send_client_event(
+        &self,
+        app: &App,
+        channel: &str,
+        event: &str,
+        data: serde_json::Value,
+        socket_id: Option<&str>,
+        user_id: Option<&str>,
+    ) -> Result<()> {
         if let Some(sender) = &self.sender {
-            sender.send_client_event(app, channel, event, data, socket_id, user_id).await
+            sender
+                .send_client_event(app, channel, event, data, socket_id, user_id)
+                .await
         } else {
             Ok(())
         }

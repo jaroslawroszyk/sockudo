@@ -285,7 +285,10 @@ impl Adapter for LocalAdapter {
         namespace.remove_user(ws).await
     }
 
-    async fn get_channels_with_socket_count(&mut self, app_id: &str) -> Result<DashMap<String, usize>> {
+    async fn get_channels_with_socket_count(
+        &mut self,
+        app_id: &str,
+    ) -> Result<DashMap<String, usize>> {
         let namespace = self.get_or_create_namespace(app_id).await;
         let channels = namespace.get_channels_with_socket_count().await;
         Ok(channels?)

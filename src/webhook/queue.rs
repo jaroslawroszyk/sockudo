@@ -2,13 +2,11 @@ use crate::error::Result; // Assuming this defines your Result type (e.g., anyho
 use crate::log::Log;
 use crate::webhook::types::JobData; // Assuming JobData is defined and is Send + Sync + Serialize + DeserializeOwned
 use async_trait::async_trait;
-use redis::{RedisResult, AsyncCommands, aio::MultiplexedConnection, RedisError}; // Added RedisError
-use serde::{Serialize, de::DeserializeOwned}; // Added Serialize, DeserializeOwned traits for JobData
+use redis::{aio::MultiplexedConnection, AsyncCommands, RedisError, RedisResult}; // Added RedisError
+use serde::{de::DeserializeOwned, Serialize}; // Added Serialize, DeserializeOwned traits for JobData
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-
-
 
 // Define JobData if not already defined (ensure it derives needed traits)
 // #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,12 +17,10 @@ use tokio::sync::Mutex;
 // Ensure JobData implements necessary traits if not already done
 impl JobData where JobData: Serialize + DeserializeOwned {}
 
-
 // Define a type alias for the callback for clarity and easier management
 type JobProcessorFn = Box<dyn Fn(JobData) -> Result<()> + Send + Sync + 'static>;
 // Define a type alias for the Arc'd callback used in Redis manager
 type ArcJobProcessorFn = Arc<dyn Fn(JobData) -> Result<()> + Send + Sync + 'static>;
-
 
 #[async_trait]
 pub trait QueueInterface: Send + Sync {
@@ -69,7 +65,8 @@ impl MemoryQueueManager {
                 interval.tick().await;
 
                 // Iterate through queues. DashMap allows concurrent access.
-                for queue_entry in queues.iter() { // Use iter() for read access
+                for queue_entry in queues.iter() {
+                    // Use iter() for read access
                     let queue_name = queue_entry.key().clone();
 
                     // Get the processor for this queue
@@ -82,15 +79,23 @@ impl MemoryQueueManager {
                             let jobs_to_process: Vec<JobData> = jobs_vec.drain(..).collect();
 
                             if !jobs_to_process.is_empty() {
-                                Log::info(format!("Processing {} jobs from memory queue {}", jobs_to_process.len(), queue_name));
+                                Log::info(format!(
+                                    "Processing {} jobs from memory queue {}",
+                                    jobs_to_process.len(),
+                                    queue_name
+                                ));
                                 // Process each job sequentially within this tick
                                 for job in jobs_to_process {
                                     // Clone the Arc'd processor for the call
                                     let processor_clone = processor.clone();
-                                    match processor_clone(job) { // Call the Arc'd function
-                                        Ok(_) => {},
+                                    match processor_clone(job) {
+                                        // Call the Arc'd function
+                                        Ok(_) => {}
                                         Err(e) => {
-                                            Log::error(format!("Error processing job from memory queue {}: {}", queue_name, e));
+                                            Log::error(format!(
+                                                "Error processing job from memory queue {}: {}",
+                                                queue_name, e
+                                            ));
                                             // Potential: Add logic here to requeue the job if needed
                                         }
                                     }
@@ -108,7 +113,10 @@ impl MemoryQueueManager {
 impl QueueInterface for MemoryQueueManager {
     async fn add_to_queue(&self, queue_name: &str, data: JobData) -> Result<()> {
         // Ensure queue Vec exists using entry API for atomicity
-        self.queues.entry(queue_name.to_string()).or_default().push(data);
+        self.queues
+            .entry(queue_name.to_string())
+            .or_default()
+            .push(data);
         Ok(())
     }
 
@@ -117,8 +125,12 @@ impl QueueInterface for MemoryQueueManager {
         self.queues.entry(queue_name.to_string()).or_default();
 
         // Register processor, wrapping it in Arc
-        self.processors.insert(queue_name.to_string(), Arc::from(callback)); // Store as Arc
-        Log::info(format!("Registered processor for memory queue: {}", queue_name));
+        self.processors
+            .insert(queue_name.to_string(), Arc::from(callback)); // Store as Arc
+        Log::info(format!(
+            "Registered processor for memory queue: {}",
+            queue_name
+        ));
 
         Ok(())
     }
@@ -128,7 +140,6 @@ impl QueueInterface for MemoryQueueManager {
         Ok(())
     }
 }
-
 
 // --- RedisQueueManager ---
 
@@ -145,11 +156,16 @@ impl RedisQueueManager {
     /// Creates a new RedisQueueManager instance.
     /// Connects to Redis and returns a Result.
     pub async fn new(redis_url: &str, prefix: &str, concurrency: usize) -> Result<Self> {
-        let client = redis::Client::open(redis_url)
-            .map_err(|e| crate::error::Error::Config(format!("Failed to open Redis client: {}", e)))?; // Use custom error type
+        let client = redis::Client::open(redis_url).map_err(|e| {
+            crate::error::Error::Config(format!("Failed to open Redis client: {}", e))
+        })?; // Use custom error type
 
-        let connection = client.get_multiplexed_async_connection().await
-            .map_err(|e| crate::error::Error::Connection(format!("Failed to get Redis connection: {}", e)))?; // Use custom error type
+        let connection = client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| {
+                crate::error::Error::Connection(format!("Failed to get Redis connection: {}", e))
+            })?; // Use custom error type
 
         Ok(Self {
             redis_connection: Arc::new(Mutex::new(connection)),
@@ -184,8 +200,12 @@ impl QueueInterface for RedisQueueManager {
         let mut conn = self.redis_connection.lock().await;
 
         // Perform RPUSH and handle potential Redis errors
-        conn.rpush(&queue_key, data_json).await
-            .map_err(|e| crate::error::Error::Queue(format!("Redis RPUSH failed for queue {}: {}", queue_name, e)))?; // Use custom error type
+        conn.rpush(&queue_key, data_json).await.map_err(|e| {
+            crate::error::Error::Queue(format!(
+                "Redis RPUSH failed for queue {}: {}",
+                queue_name, e
+            ))
+        })?; // Use custom error type
 
         // Log::info(format!("Added job to Redis queue: {}", queue_name)); // Optional: reduce log verbosity
 
@@ -195,7 +215,7 @@ impl QueueInterface for RedisQueueManager {
     /// Registers a callback for a queue and starts worker tasks to process jobs.
     async fn process_queue(&self, queue_name: &str, callback: JobProcessorFn) -> Result<()>
     where
-        JobData: DeserializeOwned + Send + 'static // Ensure JobData can be deserialized and sent across threads
+        JobData: DeserializeOwned + Send + 'static, // Ensure JobData can be deserialized and sent across threads
     {
         let queue_key = self.format_key(queue_name).await;
 
@@ -203,8 +223,12 @@ impl QueueInterface for RedisQueueManager {
         let processor_arc: ArcJobProcessorFn = Arc::from(callback);
 
         // Store the Arc'd callback
-        self.job_processors.insert(queue_name.to_string(), processor_arc.clone());
-        Log::info(format!("Registered processor and starting workers for Redis queue: {}", queue_name));
+        self.job_processors
+            .insert(queue_name.to_string(), processor_arc.clone());
+        Log::info(format!(
+            "Registered processor and starting workers for Redis queue: {}",
+            queue_name
+        ));
 
         // Start worker tasks
         for i in 0..self.concurrency {
@@ -214,10 +238,14 @@ impl QueueInterface for RedisQueueManager {
             let worker_queue_name = queue_name.to_string(); // Clone queue name for logging
 
             tokio::spawn(async move {
-                Log::info(format!("Starting Redis queue worker {} for queue: {}", i, worker_queue_name));
+                Log::info(format!(
+                    "Starting Redis queue worker {} for queue: {}",
+                    i, worker_queue_name
+                ));
 
                 loop {
-                    let blpop_result: RedisResult<Option<(String, String)>> = { // Type hint for clarity
+                    let blpop_result: RedisResult<Option<(String, String)>> = {
+                        // Type hint for clarity
                         let mut conn = worker_redis_conn.lock().await;
                         // Use BLPOP with a timeout (e.g., 1 second)
                         conn.blpop(&worker_queue_key, 1.0).await
@@ -229,28 +257,32 @@ impl QueueInterface for RedisQueueManager {
                             match serde_json::from_str::<JobData>(&job_data_str) {
                                 Ok(job_data) => {
                                     // Execute the job processing callback
-                                    if let Err(e) = worker_processor(job_data) { // Call the Arc'd function
+                                    if let Err(e) = worker_processor(job_data) {
+                                        // Call the Arc'd function
                                         Log::error(format!("[Worker {}] Error processing job from Redis queue {}: {}", i, worker_queue_name, e));
                                         // Potential: Add logic here for error handling (e.g., move to dead-letter queue)
                                     } else {
                                         // Log::info(format!("[Worker {}] Successfully processed job from Redis queue {}", i, worker_queue_name)); // Optional success log
                                     }
-                                },
+                                }
                                 Err(e) => {
                                     // Failed to deserialize the job data
                                     Log::error(format!("[Worker {}] Error deserializing job data from Redis queue {}: {}. Data: '{}'", i, worker_queue_name, e, job_data_str));
                                     // Potential: Move corrupted data to a specific place?
                                 }
                             }
-                        },
+                        }
                         // BLPOP timed out, no job available
                         Ok(None) => {
                             // Continue loop to wait again
                             continue;
-                        },
+                        }
                         // Redis error during BLPOP
                         Err(e) => {
-                            Log::error(format!("[Worker {}] Redis BLPOP error on queue {}: {}", i, worker_queue_name, e));
+                            Log::error(format!(
+                                "[Worker {}] Redis BLPOP error on queue {}: {}",
+                                i, worker_queue_name, e
+                            ));
                             // Avoid hammering Redis on persistent errors
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
@@ -269,7 +301,6 @@ impl QueueInterface for RedisQueueManager {
     }
 }
 
-
 // --- QueueManagerFactory ---
 
 /// Factory for creating queue managers
@@ -281,20 +312,25 @@ impl QueueManagerFactory {
         driver: &str,
         redis_url: Option<&str>,
         prefix: Option<&str>,
-        concurrency: Option<usize>
-    ) -> Result<Box<dyn QueueInterface>> { // Return Result to propagate errors
+        concurrency: Option<usize>,
+    ) -> Result<Box<dyn QueueInterface>> {
+        // Return Result to propagate errors
         match driver {
             "redis" => {
                 let url = redis_url.unwrap_or("redis://127.0.0.1:6379/");
                 let prefix_str = prefix.unwrap_or("sockudo"); // Consider a more generic default or make it mandatory?
                 let concurrency_val = concurrency.unwrap_or(5); // Default concurrency
-                Log::info(format!("Creating Redis queue manager (URL: {}, Prefix: {}, Concurrency: {})", url, prefix_str, concurrency_val));
+                Log::info(format!(
+                    "Creating Redis queue manager (URL: {}, Prefix: {}, Concurrency: {})",
+                    url, prefix_str, concurrency_val
+                ));
                 // Use `?` to propagate potential errors from RedisQueueManager::new
                 let manager = RedisQueueManager::new(url, prefix_str, concurrency_val).await?;
                 // Note: Redis workers are started via process_queue, not here.
                 Ok(Box::new(manager))
-            },
-            "memory" | _ => { // Default to memory queue manager
+            }
+            "memory" | _ => {
+                // Default to memory queue manager
                 Log::info("Creating Memory queue manager".to_string());
                 let manager = MemoryQueueManager::new();
                 // Start the single processing loop for the memory manager *after* creation.
@@ -305,7 +341,6 @@ impl QueueManagerFactory {
         }
     }
 }
-
 
 // --- QueueManager Wrapper ---
 // Seems fine, just delegates calls.
@@ -367,15 +402,24 @@ mod error {
 mod log {
     pub struct Log;
     impl Log {
-        pub fn info(msg: String) { println!("INFO: {}", msg); }
-        pub fn error(msg: String) { eprintln!("ERROR: {}", msg); }
+        pub fn info(msg: String) {
+            println!("INFO: {}", msg);
+        }
+        pub fn error(msg: String) {
+            eprintln!("ERROR: {}", msg);
+        }
         // Add other levels (warn, debug, trace)
     }
 }
 
 // --- Webhook Types (Example Placeholder) ---
-mod webhook { pub mod types {
-    use serde::{Deserialize, Serialize};
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct JobData { pub id: u32, pub payload: String }
-}}
+mod webhook {
+    pub mod types {
+        use serde::{Deserialize, Serialize};
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct JobData {
+            pub id: u32,
+            pub payload: String,
+        }
+    }
+}

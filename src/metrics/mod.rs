@@ -6,8 +6,9 @@ pub use prometheus::PrometheusMetricsDriver;
 
 use crate::app::config::App;
 use crate::websocket::SocketId;
-use std::sync::Arc;
 use async_trait::async_trait;
+use serde_json::Value;
+use std::sync::Arc;
 
 /// Metrics Interface trait that any metrics driver should implement
 #[async_trait]
@@ -22,7 +23,12 @@ pub trait MetricsInterface: Send + Sync {
     fn mark_disconnection(&self, app_id: &str, socket_id: &SocketId);
 
     /// Handle a new API message event being received and sent out
-    fn mark_api_message(&self, app_id: &str, incoming_message_size: usize, sent_message_size: usize);
+    fn mark_api_message(
+        &self,
+        app_id: &str,
+        incoming_message_size: usize,
+        sent_message_size: usize,
+    );
 
     /// Handle a new WS client message event being sent
     fn mark_ws_message_sent(&self, app_id: &str, sent_message_size: usize);
@@ -48,6 +54,9 @@ pub trait MetricsInterface: Send + Sync {
     /// Get the stored metrics as plain text, if possible
     async fn get_metrics_as_plaintext(&self) -> String;
 
+    /// Get the stored metrics as JSON, if possible
+    async fn get_metrics_as_json(&self) -> Value;
+
     /// Reset the metrics at the server level
     async fn clear(&self);
 }
@@ -66,7 +75,7 @@ impl MetricsFactory {
             "prometheus" => {
                 let driver = PrometheusMetricsDriver::new(port, prefix).await;
                 Some(Arc::new(driver))
-            },
+            }
             // Add more drivers here
             _ => None,
         }

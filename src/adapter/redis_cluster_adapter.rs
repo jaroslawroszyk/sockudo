@@ -879,7 +879,10 @@ impl Adapter for RedisClusterAdapter {
         Ok(())
     }
 
-    async fn get_channels_with_socket_count(&mut self, app_id: &str) -> Result<DashMap<String, usize>> {
+    async fn get_channels_with_socket_count(
+        &mut self,
+        app_id: &str,
+    ) -> Result<DashMap<String, usize>> {
         let node_count = self.get_node_count().await?; // Get count first
         let mut horizontal = self.horizontal.lock().await; // Lock for local + potential remote
 

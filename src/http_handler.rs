@@ -4,11 +4,12 @@ use crate::protocol::messages::PusherApiMessage;
 use crate::utils;
 use crate::websocket::SocketId;
 use axum::extract::{Path, Query, State};
-use axum::http::{Response, StatusCode};
+use axum::http::{header, HeaderValue, Response, StatusCode};
 use axum::response::{IntoResponse, Response as AxumResponse}; // Renamed Response to avoid conflict
-use axum::Json;
+use axum::{response, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use sysinfo::System;
 
@@ -51,7 +52,7 @@ pub async fn usage() -> impl IntoResponse {
     let total = sys.total_memory() * 1024;
     let used = sys.used_memory() * 1024;
     let free = total.saturating_sub(used); // Use saturating_sub for safety
-    // Calculate percentage, handle potential division by zero if total is 0.
+                                           // Calculate percentage, handle potential division by zero if total is 0.
     let percent = if total > 0 {
         (used as f64 / total as f64) * 100.0
     } else {
@@ -91,7 +92,8 @@ pub async fn events(
     Query(_query): Query<EventQuery>, // Query params currently unused, but parsed. Add validation if needed.
     State(handler): State<Arc<ConnectionHandler>>,
     Json(event): Json<PusherApiMessage>, // The event payload from the request body.
-) -> AxumResponse { // Explicit return type for better error handling
+) -> AxumResponse {
+    // Explicit return type for better error handling
     Log::info(format!("Received event for app {}: {:?}", app_id, event));
 
     // Destructure the event, cloning necessary parts.
@@ -253,12 +255,19 @@ pub async fn batch_events(
     Path(app_id): Path<String>,
     State(handler): State<Arc<ConnectionHandler>>,
     Json(batch): Json<Vec<PusherApiMessage>>, // Expecting a JSON array of events.
-) -> AxumResponse { // Explicit return type
+) -> AxumResponse {
+    // Explicit return type
     Log::info(format!(
         "Received batch of {} events for app {}",
         batch.len(),
         app_id
     ));
+
+    // Calculate incoming message size for metrics
+    let batch_size = match serde_json::to_string(&batch) {
+        Ok(serialized_batch) => serialized_batch.as_bytes().len(),
+        Err(_) => 0,
+    };
 
     // --- Application Validation (Optional but recommended) ---
     // Consider adding the same app validation as in the `events` handler here
@@ -323,8 +332,24 @@ pub async fn batch_events(
         }
     }
 
+    // Prepare the response
+    let response = json!({ "ok": true });
+    let response_json = serde_json::to_string(&response).unwrap_or_default();
+    let response_size = response_json.len();
+
+    // Record metrics if available
+    if let Some(metrics) = &handler.metrics {
+        let metrics = metrics.lock().await;
+        metrics.mark_api_message(
+            &app_id,
+            batch_size,    // Incoming message size
+            response_size, // Outgoing message size
+        );
+        Log::info("Recorded API message metrics");
+    }
+
     // Return OK after processing the entire batch.
-    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 /// GET /apps/{app_id}/channels/{channel_name}
@@ -342,6 +367,23 @@ pub async fn channel(
     let response_data = handler
         .channel(app_id.as_str(), channel_name.as_str())
         .await;
+    let metrics = handler.metrics.clone();
+    if let Some(metrics_data) = metrics {
+        Log::info("Metrics available, attempting to mark connection.");
+        let metrics_data = metrics_data.lock().await;
+        let channels_data_size = utils::data_to_bytes_flexible(Vec::from([response_data.clone()]));
+        // Example: Mark a conceptual 'new connection' for health check purposes.
+        // This might need adjustment based on actual metrics logic.
+        metrics_data.mark_api_message(
+            &app_id,
+            0,                  // Assuming no outgoing message size for this request
+            channels_data_size, // Assuming no incoming message size for this request
+        );
+        Log::info("Metrics interaction complete.");
+    } else {
+        // Log if metrics system is not available.
+        Log::info("Metrics system not configured for this handler.");
+    }
     // Return the data as JSON.
     (StatusCode::OK, Json(response_data))
 }
@@ -351,7 +393,8 @@ pub async fn channel(
 pub async fn up(
     Path(app_id): Path<String>,
     State(handler): State<Arc<ConnectionHandler>>,
-) -> AxumResponse { // Explicit return type
+) -> AxumResponse {
+    // Explicit return type
     Log::info(format!("Health check received for app {}", app_id));
 
     // --- Metrics Interaction (Optional) ---
@@ -361,7 +404,6 @@ pub async fn up(
         let metrics_data = metrics_arc.lock().await;
         // Example: Mark a conceptual 'new connection' for health check purposes.
         // This might need adjustment based on actual metrics logic.
-        metrics_data.mark_new_connection(&app_id, &SocketId::new()); // Assuming SocketId::new() is valid
         Log::info("Metrics interaction complete.");
     } else {
         // Log if metrics system is not available.
@@ -407,6 +449,96 @@ pub async fn channels(
     // Delegate fetching channels list to the handler.
     // Assuming `handler.channels` returns data suitable for JSON serialization.
     let channels_data = handler.channels(app_id.as_str()).await;
+    let metrics = handler.metrics.clone();
+    if let Some(metrics_data) = metrics {
+        Log::info("Metrics available, attempting to mark connection.");
+        let metrics_data = metrics_data.lock().await;
+        let channels_data_size = utils::data_to_bytes_flexible(Vec::from([channels_data.clone()]));
+        // Example: Mark a conceptual 'new connection' for health check purposes.
+        // This might need adjustment based on actual metrics logic.
+        metrics_data.mark_api_message(
+            &app_id,
+            0,                  // Assuming no outgoing message size for this request
+            channels_data_size, // Assuming no incoming message size for this request
+        );
+        Log::info("Metrics interaction complete.");
+    } else {
+        // Log if metrics system is not available.
+        Log::info("Metrics system not configured for this handler.");
+    }
     // Return the data as JSON.
     (StatusCode::OK, Json(channels_data))
+}
+
+pub async fn metrics(
+    State(handler): State<Arc<ConnectionHandler>>,
+) -> axum::response::Response<String> {
+    Log::info("Metrics endpoint called");
+
+    let metrics_data = match handler.metrics.clone() {
+        Some(metrics_data) => {
+            Log::info("Metrics endpoint");
+            let metrics_data = metrics_data.lock().await;
+            metrics_data.get_metrics_as_plaintext().await
+        }
+        None => {
+            return axum::response::Response::builder()
+                .status(200)
+                .header("X-Custom-Foo", "Bar")
+                .body("No metrics available".to_string())
+                .unwrap();
+        }
+    };
+
+    // Simple solution using a tuple
+    Log::info(format!("Metrics: {:?}", metrics_data));
+    let mut headers = HashMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4"),
+    );
+    axum::response::Response::builder()
+        .status(200)
+        .header("X-Custom-Foo", "Bar")
+        .body(metrics_data)
+        .unwrap()
+}
+
+/// GET /apps/{app_id}/channels/{channel_name}/users
+/// Retrieves a list of users in a specific channel within an app.
+pub async fn channel_users(
+    Path((app_id, channel_name)): Path<(String, String)>, // Extract both path params
+    State(handler): State<Arc<ConnectionHandler>>,
+) -> impl IntoResponse {
+    Log::info(format!(
+        "Request for users in channel: app={}, channel={}",
+        app_id, channel_name
+    ));
+    // Delegate fetching user list to the handler.
+    // Assuming `handler.channel_users` returns data suitable for JSON serialization.
+    let users_data = handler
+        .channel_users(app_id.as_str(), channel_name.as_str())
+        .await.unwrap();
+    
+    let metrics = handler.metrics.clone();
+    if let Some(metrics_data) = metrics {
+        Log::info("Metrics available, attempting to mark connection.");
+        let metrics_data = metrics_data.lock().await;
+        let users_data = serde_json::to_string(&users_data).unwrap_or_default();
+        let users_data_size = users_data.as_bytes().len();
+        // Example: Mark a conceptual 'new connection' for health check purposes.
+        // This might need adjustment based on actual metrics logic.
+        metrics_data.mark_api_message(
+            &app_id,
+            0,                  // Assuming no outgoing message size for this request
+            users_data_size,    // Assuming no incoming message size for this request
+        );
+        Log::info("Metrics interaction complete.");
+    } else {
+        // Log if metrics system is not available.
+        Log::info("Metrics system not configured for this handler.");
+    }
+    let response = json!({ "users": users_data });
+    // Return the data as JSON.
+    (StatusCode::OK, Json(response))
 }

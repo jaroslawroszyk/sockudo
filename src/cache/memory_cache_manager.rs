@@ -45,7 +45,6 @@ use std::time::{Duration, Instant};
 // }
 // --- End Placeholders ---
 
-
 /// Configuration for the Memory cache manager using Moka
 #[derive(Clone, Debug)]
 pub struct MemoryCacheConfig {
@@ -67,7 +66,7 @@ impl Default for MemoryCacheConfig {
             prefix: "memory_cache".to_string(),
             response_timeout: Some(Duration::from_secs(5)),
             default_ttl: Some(Duration::from_secs(3600)), // 1 hour default TTL
-            max_capacity: 10_000, // Default max capacity
+            max_capacity: 10_000,                         // Default max capacity
         }
     }
 }
@@ -86,8 +85,7 @@ pub struct MemoryCacheManager {
 impl MemoryCacheManager {
     /// Creates a new Memory cache manager with Moka configuration.
     pub fn new(config: MemoryCacheConfig) -> Self {
-        let cache_builder = Cache::builder()
-            .max_capacity(config.max_capacity);
+        let cache_builder = Cache::builder().max_capacity(config.max_capacity);
 
         // Set default time_to_live if provided
         let cache = if let Some(ttl) = config.default_ttl {
@@ -188,7 +186,6 @@ impl CacheManager for MemoryCacheManager {
 //     }
 // }
 
-
 /// Extension methods for MemoryCacheManager using Moka
 impl MemoryCacheManager {
     /// Delete a key from the cache.
@@ -232,7 +229,6 @@ impl MemoryCacheManager {
         Ok(())
     }
 }
-
 
 /// Update the cache manager factory to support Moka-based memory cache
 impl crate::cache::factory::CacheFactory {

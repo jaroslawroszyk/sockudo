@@ -6,11 +6,11 @@ use crate::token::Token;
 use crate::websocket::SocketId;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use futures_util::{stream, StreamExt};
+use moka::future::Cache;
 use sqlx::{mysql::MySqlPoolOptions, MySqlPool};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use futures_util::{stream, StreamExt};
-use moka::future::Cache;
 use tokio::sync::Mutex;
 use tokio::time::interval;
 
@@ -142,7 +142,7 @@ impl MySQLAppManager {
     pub async fn get_app(&self, app_id: &str) -> Result<Option<App>> {
         // Try to get from cache first
         if let Some(app) = self.app_cache.get(app_id).await {
-            return Ok(Some(app))
+            return Ok(Some(app));
         }
 
         // Not in cache or expired, fetch from database
@@ -186,8 +186,7 @@ impl MySQLAppManager {
             let app = app_row.into_app();
 
             // Update cache
-            self.app_cache
-                .insert(app_id.to_string(), app.clone()).await;
+            self.app_cache.insert(app_id.to_string(), app.clone()).await;
 
             Ok(Some(app))
         } else {
@@ -199,7 +198,7 @@ impl MySQLAppManager {
     pub async fn get_app_by_key(&self, key: &str) -> Result<Option<App>> {
         // Check cache first
         if let Some(app) = self.app_cache.get(key).await {
-            return Ok(Some(app))
+            return Ok(Some(app));
         }
 
         // Not found in cache, query database
@@ -292,8 +291,7 @@ impl MySQLAppManager {
             })?;
 
         // Update cach
-        self.app_cache
-            .insert(app.id.clone(), app).await;
+        self.app_cache.insert(app.id.clone(), app).await;
 
         Ok(())
     }
@@ -345,8 +343,7 @@ impl MySQLAppManager {
         }
 
         // Update cache
-        self.app_cache
-            .insert(app.id.clone(), app).await;
+        self.app_cache.insert(app.id.clone(), app).await;
 
         Ok(())
     }
@@ -410,7 +407,10 @@ impl MySQLAppManager {
                 Error::InternalError(format!("Failed to fetch apps from MySQL: {}", e))
             })?;
 
-        Log::warning(format!("Fetched {} app rows from database.", app_rows.len()));
+        Log::warning(format!(
+            "Fetched {} app rows from database.",
+            app_rows.len()
+        ));
 
         // Process rows concurrently using streams:
         // 1. Convert iterator to stream
@@ -619,9 +619,7 @@ impl AppManager for MySQLAppManager {
 
     async fn get_app(&self, app_id: &str) -> Result<Option<App>> {
         // For the sync interface, poll the async function in a blocking manner
-        self.get_app(app_id)
-            .await
-            .map(|app| app.map(|a| a.clone()))
+        self.get_app(app_id).await.map(|app| app.map(|a| a.clone()))
     }
 
     async fn get_app_by_key(&self, key: &str) -> Result<Option<App>> {
@@ -659,7 +657,7 @@ impl Clone for MySQLAppManager {
         Self {
             config: self.config.clone(),
             pool: self.pool.clone(),
-            app_cache: self.app_cache.clone()
+            app_cache: self.app_cache.clone(),
         }
     }
 }

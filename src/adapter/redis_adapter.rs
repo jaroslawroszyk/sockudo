@@ -847,7 +847,10 @@ impl Adapter for RedisAdapter {
         Ok(())
     }
 
-    async fn get_channels_with_socket_count(&mut self, app_id: &str) -> Result<DashMap<String, usize>> {
+    async fn get_channels_with_socket_count(
+        &mut self,
+        app_id: &str,
+    ) -> Result<DashMap<String, usize>> {
         let node_count = self.get_node_count().await?; // Get count first
         let mut horizontal = self.horizontal.lock().await; // Lock for local + potential remote
 
@@ -855,7 +858,7 @@ impl Adapter for RedisAdapter {
         if node_count > 1 {
             // send_request handles its own locking/timing
             // We ignore the result here as it's a "fire and forget" termination broadcast
-           match horizontal
+            match horizontal
                 .send_request(
                     app_id,
                     RequestType::ChannelsWithSocketsCount,
@@ -864,7 +867,8 @@ impl Adapter for RedisAdapter {
                     None,
                     node_count,
                 )
-                .await {
+                .await
+            {
                 Ok(response_data) => {
                     // Merge the local and remote data
                     let mut channels = horizontal
@@ -882,7 +886,7 @@ impl Adapter for RedisAdapter {
                         e
                     ));
                 }
-           }
+            }
         }
 
         Ok(horizontal

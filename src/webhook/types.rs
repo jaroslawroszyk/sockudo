@@ -44,7 +44,6 @@ impl WebhookEvent {
     }
 }
 
-
 // --- Other structs remain the same ---
 
 /// Client event data structure for webhooks
@@ -113,7 +112,6 @@ pub struct Webhook {
     pub headers: Option<HashMap<String, String>>,
 }
 
-
 /// Define a static empty Vec<Webhook> using once_cell
 static EMPTY_WEBHOOKS: Lazy<Vec<Webhook>> = Lazy::new(Vec::new);
 
@@ -136,65 +134,70 @@ pub trait AppWebhook {
 //     }
 // }
 
-
 impl AppWebhook for App {
     fn has_client_event_webhooks(&self) -> bool {
         self.webhooks.as_ref().map_or(false, |webhooks| {
-            webhooks.iter().any(|webhook|
-                webhook.event_types.iter().any(|event_type|
-                    event_type == WebhookEvent::ClientEvent.as_str()
-                )
-            )
+            webhooks.iter().any(|webhook| {
+                webhook
+                    .event_types
+                    .iter()
+                    .any(|event_type| event_type == WebhookEvent::ClientEvent.as_str())
+            })
         })
     }
 
     fn has_channel_occupied_webhooks(&self) -> bool {
         self.webhooks.as_ref().map_or(false, |webhooks| {
-            webhooks.iter().any(|webhook|
-                webhook.event_types.iter().any(|event_type|
-                    event_type == WebhookEvent::ChannelOccupied.as_str()
-                )
-            )
+            webhooks.iter().any(|webhook| {
+                webhook
+                    .event_types
+                    .iter()
+                    .any(|event_type| event_type == WebhookEvent::ChannelOccupied.as_str())
+            })
         })
     }
 
     fn has_channel_vacated_webhooks(&self) -> bool {
         self.webhooks.as_ref().map_or(false, |webhooks| {
-            webhooks.iter().any(|webhook|
-                webhook.event_types.iter().any(|event_type|
-                    event_type == WebhookEvent::ChannelVacated.as_str()
-                )
-            )
+            webhooks.iter().any(|webhook| {
+                webhook
+                    .event_types
+                    .iter()
+                    .any(|event_type| event_type == WebhookEvent::ChannelVacated.as_str())
+            })
         })
     }
 
     fn has_member_added_webhooks(&self) -> bool {
         self.webhooks.as_ref().map_or(false, |webhooks| {
-            webhooks.iter().any(|webhook|
-                webhook.event_types.iter().any(|event_type|
-                    event_type == WebhookEvent::MemberAdded.as_str()
-                )
-            )
+            webhooks.iter().any(|webhook| {
+                webhook
+                    .event_types
+                    .iter()
+                    .any(|event_type| event_type == WebhookEvent::MemberAdded.as_str())
+            })
         })
     }
 
     fn has_member_removed_webhooks(&self) -> bool {
         self.webhooks.as_ref().map_or(false, |webhooks| {
-            webhooks.iter().any(|webhook|
-                webhook.event_types.iter().any(|event_type|
-                    event_type == WebhookEvent::MemberRemoved.as_str()
-                )
-            )
+            webhooks.iter().any(|webhook| {
+                webhook
+                    .event_types
+                    .iter()
+                    .any(|event_type| event_type == WebhookEvent::MemberRemoved.as_str())
+            })
         })
     }
 
     fn has_cache_missed_webhooks(&self) -> bool {
         self.webhooks.as_ref().map_or(false, |webhooks| {
-            webhooks.iter().any(|webhook|
-                webhook.event_types.iter().any(|event_type|
-                    event_type == WebhookEvent::CacheMiss.as_str()
-                )
-            )
+            webhooks.iter().any(|webhook| {
+                webhook
+                    .event_types
+                    .iter()
+                    .any(|event_type| event_type == WebhookEvent::CacheMiss.as_str())
+            })
         })
     }
 
