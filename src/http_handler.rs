@@ -1,17 +1,66 @@
 use crate::adapter::ConnectionHandler;
-use crate::log::Log;
-use crate::protocol::messages::PusherApiMessage;
-use crate::utils;
+use crate::protocol::messages::{BatchPusherApiMessage, PusherApiMessage};
+// Ensure the utils module/functions are accessible
+use crate::utils; // Assuming utils is a module in the crate root
 use crate::websocket::SocketId;
-use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderValue, Response, StatusCode};
-use axum::response::{IntoResponse, Response as AxumResponse}; // Renamed Response to avoid conflict
-use axum::{response, Json};
+use axum::{
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, Response, StatusCode},
+    response::{IntoResponse, Response as AxumResponse},
+    Json,
+};
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::HashMap;
-use std::sync::Arc;
+use serde_json::{json, Value};
+use std::{fmt, sync::Arc}; // Removed unused HashMap import
 use sysinfo::System;
+use thiserror::Error;
+use tracing::{error, field, info, instrument, warn};
+use crate::log::Log;
+// Added field back
+
+// --- Custom Error Type ---
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("Application not found: {0}")]
+    AppNotFound(String),
+    #[error("Application validation failed: {0}")]
+    AppValidationFailed(String),
+    #[error("Channel validation failed: Missing 'channels' or 'channel' field")]
+    MissingChannelInfo,
+    #[error("User connection termination failed: {0}")]
+    TerminationFailed(String),
+    #[error("Internal Server Error: {0}")]
+    InternalError(String),
+    #[error("Serialization Error: {0}")]
+    SerializationError(#[from] serde_json::Error),
+    #[error("HTTP Header Build Error: {0}")]
+    HeaderBuildError(#[from] axum::http::Error),
+    // Example: Add more specific errors if handler methods return them
+    // #[error("Database Error: {0}")]
+    // DatabaseError(String),
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> AxumResponse {
+        let (status, error_message) = match &self { // Match by reference
+            AppError::AppNotFound(msg) => (StatusCode::NOT_FOUND, json!({ "error": msg })),
+            AppError::AppValidationFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": msg })),
+            AppError::MissingChannelInfo => (StatusCode::BAD_REQUEST, json!({ "error": "Request must contain 'channels' (list) or 'channel' (string)" })),
+            AppError::TerminationFailed(msg) => (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": msg })),
+            AppError::SerializationError(e) => (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": format!("Internal error during serialization: {}", e) })),
+            AppError::HeaderBuildError(e) => (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": format!("Internal error building response: {}", e) })),
+            AppError::InternalError(msg) => (StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": msg })),
+            // Map other error variants here
+        };
+
+        // Log the error with its details using the Display impl from thiserror
+        error!(error.message = %self, status_code = %status, "Request failed");
+
+        (status, Json(error_message)).into_response()
+    }
+}
 
 // --- Structs for API Responses/Requests ---
 
@@ -28,517 +77,441 @@ struct UsageResponse {
     memory: MemoryStats,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Debug)]
 pub struct EventQuery {
-    // Authentication related query parameters (consider validation)
+    #[allow(dead_code)]
     auth_key: String,
+    #[allow(dead_code)]
     auth_timestamp: String,
+    #[allow(dead_code)]
     auth_version: String,
+    #[allow(dead_code)]
     body_md5: String,
+    #[allow(dead_code)]
     auth_signature: String,
 }
 
 // --- Axum Handlers ---
 
 /// GET /usage
-/// Provides system memory usage statistics.
-pub async fn usage() -> impl IntoResponse {
+#[instrument(skip_all, fields(service = "usage_monitor"))]
+pub async fn usage() -> Result<impl IntoResponse, AppError> {
     let mut sys = System::new_all();
-    // Refresh system data to get latest stats.
     sys.refresh_all();
 
-    // Get memory statistics from sysinfo.
-    // Note: sysinfo provides values in KiB, converting to bytes.
     let total = sys.total_memory() * 1024;
     let used = sys.used_memory() * 1024;
-    let free = total.saturating_sub(used); // Use saturating_sub for safety
-                                           // Calculate percentage, handle potential division by zero if total is 0.
+    let free = total.saturating_sub(used);
     let percent = if total > 0 {
         (used as f64 / total as f64) * 100.0
     } else {
         0.0
     };
 
-    let memory_stats = MemoryStats {
-        free,
-        used,
-        total,
-        percent,
-    };
+    let memory_stats = MemoryStats { free, used, total, percent };
+    let response_payload = UsageResponse { memory: memory_stats };
 
-    // Create the JSON response body.
-    let response = UsageResponse {
-        memory: memory_stats,
-    };
-
-    // Log memory usage for monitoring purposes.
-    // Consider using a structured logging format.
-    tracing::info!(
-        "Memory usage - Total: {} bytes, Used: {} bytes, Free: {} bytes, Usage: {:.2}%",
-        total,
-        used,
-        free,
-        percent
+    info!(
+        total_bytes = total,
+        used_bytes = used,
+        free_bytes = free,
+        usage_percent = format!("{:.2}", percent), // Keep format for readability in logs
+        "Memory usage queried"
     );
 
-    // Return JSON response with status OK.
-    (StatusCode::OK, Json(response))
+    Ok((StatusCode::OK, Json(response_payload)))
+}
+
+/// Helper to process a single event
+#[instrument(skip(handler, event_data), fields(app_id = app_id, event_name = field::Empty))] // Defer setting event_name
+async fn process_single_event(
+    handler: &Arc<ConnectionHandler>,
+    app_id: &str,
+    event_data: PusherApiMessage, // Takes ownership
+) -> Result<(), AppError> {
+    let PusherApiMessage {
+        name, // Moved: String
+        data, // Moved: Value
+        channels, // Moved: Option<Vec<String>>
+        channel, // Moved: Option<String>
+        socket_id: original_socket_id_str, // Moved: Option<String> - Renamed for clarity
+    } = event_data;
+
+    // Add event_name to tracing span now that we have it
+    tracing::Span::current().record("event_name", &name.clone().unwrap());
+
+    // --- Prepare data needed across loop iterations ---
+    // Map the socket_id string to SocketId type *once* before the loop
+    let mapped_socket_id: Option<SocketId> = original_socket_id_str.map(SocketId);
+
+    // Clone data needed multiple times *once* if it improves clarity or performance slightly
+    // (String::clone and Value::clone are relatively cheap for typical data sizes)
+    let name_clone = name; // Take ownership of name
+    let data_clone = data; // Take ownership of data
+
+    // --- Determine target channels ---
+    let target_channels: Vec<String> = match channels { // `channels` is moved here
+        Some(ch_list) if !ch_list.is_empty() => ch_list, // ch_list (Vec<String>) is moved
+        None => match channel { // `channel` is moved here
+            Some(ch) => vec![ch], // ch (String) is moved
+            None => {
+                warn!("Missing 'channels' or 'channel' in event");
+                return Err(AppError::MissingChannelInfo);
+            }
+        },
+        Some(_) => { // channels was Some(empty_vec)
+            warn!("Empty 'channels' list provided in event");
+            return Err(AppError::MissingChannelInfo);
+        }
+    }; // `target_channels` now owns the Vec<String>
+
+    // --- Process each target channel ---
+    // Iterate by reference if we don't need to consume the Vec,
+    // or by value (`into_iter()`) if consuming is okay. Let's use by value.
+    for target_channel in target_channels { // Moves ownership of each String into loop variable
+        info!(channel = %target_channel, "Processing channel");
+
+        // Create the specific message payload for this channel
+        let message_to_send = PusherApiMessage {
+            name: name_clone.clone(), // Clone the pre-cloned name
+            data: data_clone.clone(), // Clone the pre-cloned data
+            channels: None,           // Not needed for send payload
+            channel: Some(target_channel.clone()), // Clone loop variable for payload
+            socket_id: mapped_socket_id.as_ref().map(|sid| sid.0.clone()), // Clone the inner String if present
+        };
+
+        // Send the message
+        // Pass the mapped_socket_id by reference
+        handler
+            .send_message(
+                app_id,
+                mapped_socket_id.as_ref(), // Pass Option<&SocketId>
+                message_to_send,           // Pass owned message
+                &target_channel,           // Pass borrowed channel name
+            )
+            .await; // Assuming send_message handles its own errors or returns Result that we ignore for now
+
+        // --- Caching Logic ---
+        if utils::is_cache_channel(&target_channel) {
+            // **FIXED:** Use &name_clone (which is &String), build_cache_payload expects &str
+            let data = serde_json::to_value(data_clone.clone().unwrap())?;
+            let cache_payload_str = match build_cache_payload(&name_clone.clone().unwrap().as_str(), &data) {
+                Ok(payload) => payload,
+                Err(e) => {
+                    error!(channel = %target_channel, error = %e, "Failed to serialize event data for caching");
+                    continue; // Log error and skip caching for this channel
+                }
+            };
+
+            let mut cache_manager = handler.cache_manager.lock().await;
+            let key = format!("app:{}:channel:{}:cache_miss", app_id, target_channel);
+
+            // **FIXED:** Handle cache set error without exiting the whole function
+            match cache_manager.set(&key, &cache_payload_str, 3600).await {
+                Ok(_) => {
+                    // **FIXED:** Use tracing::info!
+                    info!(channel = %target_channel, cache_key = %key, "Cached event for channel");
+                }
+                Err(e) => {
+                    // Log the error but continue processing other channels
+                    error!(channel = %target_channel, cache_key = %key, error = %e, "Failed to cache event");
+                    // Do NOT return Err here, just continue the loop
+                }
+            }
+        }
+        // Ownership of target_channel moves to the next iteration or is dropped
+    } // `target_channels` (Vec) is now fully consumed
+
+    // name_clone, data_clone, mapped_socket_id go out of scope here
+
+    Ok(())
+}
+
+/// Helper to build cache payload string
+fn build_cache_payload(event_name: &str, event_data: &Value) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&json!({
+        "event": event_name,
+        "data": event_data,
+    }))
 }
 
 /// POST /apps/{app_id}/events
-/// Handles receiving a single Pusher API event and broadcasting it.
+#[instrument(skip(handler, event), fields(app_id = %app_id))]
 pub async fn events(
     Path(app_id): Path<String>,
-    Query(_query): Query<EventQuery>, // Query params currently unused, but parsed. Add validation if needed.
+    Query(_query): Query<EventQuery>, // TODO: Implement auth validation or remove
     State(handler): State<Arc<ConnectionHandler>>,
-    Json(event): Json<PusherApiMessage>, // The event payload from the request body.
-) -> AxumResponse {
-    // Explicit return type for better error handling
-    Log::info(format!("Received event for app {}: {:?}", app_id, event));
-
-    // Destructure the event, cloning necessary parts.
-    let PusherApiMessage {
-        name, // Keep name and data for caching
-        data,
-        channels,
-        channel, // Single channel case
-        socket_id,
-    } = event.clone();
+    Json(event): Json<PusherApiMessage>,
+) -> Result<impl IntoResponse, AppError> {
+    Log::info(format!("Received event: {:?}", event));
 
     // --- Application Validation ---
-    let app_result = handler.app_manager.get_app(app_id.as_str()).await;
-    match app_result {
+    match handler.app_manager.get_app(app_id.as_str()).await {
         Ok(Some(_app)) => {
-            // App exists, proceed.
-            // TODO: Potentially use the `_app` variable for further validation if needed.
-            Log::info(format!("App {} found, processing event.", app_id));
+            info!("App found, processing event.");
         }
         Ok(None) => {
-            Log::warning(format!("App not found: {}", app_id));
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": format!("Application with id '{}' not found", app_id) })),
-            )
-                .into_response();
+            warn!("App not found during event processing.");
+            return Err(AppError::AppNotFound(app_id));
         }
         Err(e) => {
-            // Handle error during app lookup (e.g., database issue).
-            Log::error(format!("Error fetching app {}: {}", app_id, e));
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "Failed to validate application" })),
-            )
-                .into_response();
+            error!(error = %e, "Failed to fetch app details.");
+            return Err(AppError::AppValidationFailed(format!("Error fetching app: {}", e)));
         }
     }
 
-    // Map the optional socket_id string to the SocketId type.
-    let socket_id = socket_id.map(SocketId);
+    // Process the single event, consuming `event`
+    process_single_event(&handler, &app_id, event).await?;
 
-    // --- Event Broadcasting Logic ---
-    // Determine target channels: either a list or a single channel.
-    let target_channels: Vec<String> = match channels {
-        Some(ch_list) => ch_list,
-        None => match channel {
-            Some(ch) => vec![ch], // Wrap single channel in a vec
-            None => {
-                // Neither 'channels' nor 'channel' provided - invalid request.
-                Log::warning(format!(
-                    "Invalid event format for app {}: Missing 'channels' or 'channel'",
-                    app_id
-                ));
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": "Request must contain 'channels' (list) or 'channel' (string)" })),
-                )
-                    .into_response();
-            }
-        },
-    };
-
-    // --- Process each target channel ---
-    for target_channel in target_channels {
-        // Send the message via the connection handler.
-        // Note: `send_message` might need better error handling itself.
-        // Assuming it logs errors internally for now.
-        handler
-            .send_message(
-                &app_id,
-                socket_id.as_ref(), // Pass optional socket ID to exclude
-                event.clone(),      // Clone the event for each send
-                &target_channel,
-            )
-            .await;
-
-        // --- Caching Logic (if applicable) ---
-        if utils::is_cache_channel(&target_channel) {
-            // Serialize the cache payload safely.
-            let cache_value_result = serde_json::to_string(&json!({
-               "event": name, // Use destructured name
-                "data": data, // Use destructured data
-            }));
-
-            match cache_value_result {
-                Ok(value_str) => {
-                    // Acquire cache manager lock.
-                    let mut cache_manager = handler.cache_manager.lock().await;
-                    let key = format!("app:{}:channel:{}:cache_miss", app_id, target_channel);
-                    // Set cache value. `set` might need error handling too.
-                    // Assuming it logs errors internally.
-                    cache_manager.set(&key, &value_str, 3600).await; // 1 hour TTL
-                    Log::info(format!("Cached event for channel: {}", target_channel));
-                }
-                Err(e) => {
-                    // Log serialization error for caching, but don't fail the request.
-                    Log::error(format!(
-                        "Failed to serialize event data for caching (channel: {}): {}",
-                        target_channel, e
-                    ));
-                }
-            }
-        }
-    }
-
-    // If all processing succeeded, return OK.
-    (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+    Ok((StatusCode::OK, Json(json!({ "ok": true }))))
 }
 
 /// POST /apps/{app_id}/users/{user_id}/terminate_connections
-/// Terminates all active connections for a specific user within an app.
+#[instrument(skip(handler), fields(app_id = %app_id, user_id = %user_id))]
 pub async fn terminate_user_connections(
-    Path((app_id, user_id)): Path<(String, String)>, // Extract app_id and user_id
+    Path((app_id, user_id)): Path<(String, String)>,
     State(handler): State<Arc<ConnectionHandler>>,
-) -> impl IntoResponse {
-    Log::info(format!(
-        "Received request to terminate connections for user {} in app {}",
-        user_id, app_id
-    ));
+) -> Result<impl IntoResponse, AppError> {
+    info!("Received request to terminate user connections");
 
-    // Get the connection manager instance.
     let connection_manager = handler.connection_manager.clone();
 
-    // Attempt to terminate connections, handling potential errors.
     let result = connection_manager
         .lock()
         .await
-        .terminate_connection(&app_id, &user_id) // Assuming this is the correct method name
-        .await;
+        .terminate_connection(&app_id, &user_id)
+        .await; // Assuming terminate_connection returns Result<(), ErrorType>
 
     match result {
         Ok(_) => {
-            Log::info(format!(
-                "Successfully initiated termination for user {} in app {}",
-                user_id, app_id
-            ));
-            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+            info!("Successfully initiated termination for user");
+            Ok((StatusCode::OK, Json(json!({ "ok": true }))))
         }
         Err(e) => {
-            // Log the error that occurred during termination.
-            Log::error(format!(
-                "Failed to terminate connections for user {} in app {}: {}",
+            error!(error = %e, "Failed to terminate connections for user");
+            Err(AppError::TerminationFailed(format!(
+                "Failed to terminate connections for user {} in app {}: {}", // Assuming e implements Display
                 user_id, app_id, e
-            ));
-            // Return an appropriate error response.
-            // The specific status code might depend on the nature of the error `e`.
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "Failed to terminate user connections" })),
-            )
-                .into_response()
+            )))
         }
+    }
+}
+
+/// Records API metrics (helper async function)
+#[instrument(skip(handler, batch_size, response_size), fields(app_id = %app_id))]
+async fn record_api_metrics(
+    handler: &Arc<ConnectionHandler>,
+    app_id: &str,
+    batch_size: usize,
+    response_size: usize,
+) {
+    if let Some(metrics_arc) = &handler.metrics {
+        let metrics = metrics_arc.lock().await; // Correctly await the lock
+        // Assuming mark_api_message itself is synchronous after lock acquisition
+        metrics.mark_api_message(
+            app_id,
+            batch_size,
+            response_size,
+        );
+        info!(incoming_bytes = batch_size, outgoing_bytes = response_size, "Recorded API message metrics");
+    } else {
+        info!("Metrics system not available, skipping metrics recording.");
     }
 }
 
 /// POST /apps/{app_id}/batch_events
-/// Handles receiving a batch of Pusher API events and broadcasting them.
+#[instrument(skip(handler, batch_message), fields(app_id = %app_id, batch_len = batch_message.batch.len()))]
 pub async fn batch_events(
     Path(app_id): Path<String>,
     State(handler): State<Arc<ConnectionHandler>>,
-    Json(batch): Json<Vec<PusherApiMessage>>, // Expecting a JSON array of events.
-) -> AxumResponse {
-    // Explicit return type
-    Log::info(format!(
-        "Received batch of {} events for app {}",
-        batch.len(),
-        app_id
-    ));
+    Json(batch_message): Json<BatchPusherApiMessage>,
+) -> Result<impl IntoResponse, AppError> {
+    info!("Received batch events request");
 
-    // Calculate incoming message size for metrics
-    let batch_size = match serde_json::to_string(&batch) {
-        Ok(serialized_batch) => serialized_batch.as_bytes().len(),
-        Err(_) => 0,
-    };
+    let batch = batch_message.batch;
 
-    // --- Application Validation (Optional but recommended) ---
-    // Consider adding the same app validation as in the `events` handler here
-    // if you want to reject batches for non-existent apps early.
+    let batch_size = serde_json::to_vec(&batch)
+        .map_err(|e| { // Handle potential serialization error for metrics
+            warn!(error = %e, "Failed to serialize incoming batch for size calculation");
+            AppError::SerializationError(e) // Convert to AppError if we want to fail request here, or just log and use 0
+        })? // Propagate serialization error if needed
+        .len();
+
+
+    // --- Optional: Application Validation ---
     // match handler.app_manager.get_app(app_id.as_str()).await { ... }
 
-    // --- Process each event in the batch ---
-    for message in batch.iter() {
-        // Validate that channels are provided for each message in the batch.
-        let target_channels = match message.channels.as_ref() {
-            Some(ch_list) if !ch_list.is_empty() => ch_list,
-            _ => {
-                // If a message in the batch lacks channels, skip it or return an error.
-                // Skipping for robustness, but logging a warning.
-                Log::warning(format!(
-                    "Skipping message in batch for app {}: Missing 'channels'. Message: {:?}",
-                    app_id, message
-                ));
-                continue; // Skip this message, process the next one
-            }
-        };
-
-        // Map the optional socket_id for exclusion.
-        let socket_id = message.socket_id.clone().map(SocketId);
-
-        // Process each channel within the message.
-        for channel in target_channels {
-            // Send the message.
-            handler
-                .send_message(
-                    &app_id,
-                    socket_id.as_ref(),
-                    message.clone(), // Clone message for this send
-                    channel.as_str(),
-                )
-                .await;
-
-            // --- Caching Logic (if applicable) ---
-            if utils::is_cache_channel(channel) {
-                // Serialize cache payload safely.
-                let cache_value_result = serde_json::to_string(&json!({
-                   "event": message.name, // Use fields from message
-                    "data": message.data,
-                }));
-
-                match cache_value_result {
-                    Ok(value_str) => {
-                        let mut cache_manager = handler.cache_manager.lock().await;
-                        let key = format!("app:{}:channel:{}:cache_miss", app_id, channel);
-                        cache_manager.set(&key, &value_str, 3600).await;
-                        Log::info(format!("Cached batch event for channel: {}", channel));
-                    }
-                    Err(e) => {
-                        Log::error(format!(
-                            "Failed to serialize batch event data for caching (channel: {}): {}",
-                            channel, e
-                        ));
-                        // Continue processing other channels/messages
-                    }
-                }
-            }
-        }
+    // --- Sequential Processing ---
+    for message in batch { // message is moved here
+        // Pass handler and app_id by reference, move message
+        process_single_event(&handler, &app_id, message).await?; // Propagate error using ?
     }
 
-    // Prepare the response
-    let response = json!({ "ok": true });
-    let response_json = serde_json::to_string(&response).unwrap_or_default();
-    let response_size = response_json.len();
+    // --- Concurrent Processing (Alternative - see previous response for structure) ---
 
-    // Record metrics if available
-    if let Some(metrics) = &handler.metrics {
-        let metrics = metrics.lock().await;
-        metrics.mark_api_message(
-            &app_id,
-            batch_size,    // Incoming message size
-            response_size, // Outgoing message size
-        );
-        Log::info("Recorded API message metrics");
-    }
+    let response_payload = json!({ "ok": true });
+    let response_size = serde_json::to_vec(&response_payload)?.len(); // Use ? to propagate serialization error
 
-    // Return OK after processing the entire batch.
-    (StatusCode::OK, Json(response)).into_response()
+    // **FIXED:** Await the async metric recording function
+    record_api_metrics(&handler, &app_id, batch_size, response_size).await;
+
+    info!("Batch events processed successfully");
+    Ok((StatusCode::OK, Json(response_payload)))
 }
+
 
 /// GET /apps/{app_id}/channels/{channel_name}
-/// Retrieves information about a specific channel within an app.
+#[instrument(skip(handler), fields(app_id = %app_id, channel = %channel_name))]
 pub async fn channel(
-    Path((app_id, channel_name)): Path<(String, String)>, // Extract both path params
+    Path((app_id, channel_name)): Path<(String, String)>,
     State(handler): State<Arc<ConnectionHandler>>,
-) -> impl IntoResponse {
-    Log::info(format!(
-        "Request for channel info: app={}, channel={}",
-        app_id, channel_name
-    ));
-    // Delegate fetching channel info to the handler.
-    // Assuming `handler.channel` returns data suitable for JSON serialization.
-    let response_data = handler
+) -> Result<impl IntoResponse, AppError> {
+    info!("Request for channel info");
+
+    // Assume handler.channel returns Result<T, E> where T: Serialize and E: Display + Error
+    let channel_data = handler
         .channel(app_id.as_str(), channel_name.as_str())
         .await;
-    let metrics = handler.metrics.clone();
-    if let Some(metrics_data) = metrics {
-        Log::info("Metrics available, attempting to mark connection.");
-        let metrics_data = metrics_data.lock().await;
-        let channels_data_size = utils::data_to_bytes_flexible(Vec::from([response_data.clone()]));
-        // Example: Mark a conceptual 'new connection' for health check purposes.
-        // This might need adjustment based on actual metrics logic.
-        metrics_data.mark_api_message(
-            &app_id,
-            0,                  // Assuming no outgoing message size for this request
-            channels_data_size, // Assuming no incoming message size for this request
-        );
-        Log::info("Metrics interaction complete.");
-    } else {
-        // Log if metrics system is not available.
-        Log::info("Metrics system not configured for this handler.");
-    }
-    // Return the data as JSON.
-    (StatusCode::OK, Json(response_data))
+    Log::info(format!("Channel info: {:?}", channel_data));
+
+    // **FIXED:** Handle Result from data_to_bytes_flexible using ?
+    let response_size = utils::data_to_bytes_flexible(Vec::from([channel_data.clone()]));
+
+    // **FIXED:** Await the async metric recording function
+    record_api_metrics(&handler, &app_id, 0, response_size).await;
+
+    info!("Channel info retrieved successfully");
+    Ok((StatusCode::OK, Json(channel_data)))
 }
 
-/// GET /apps/{app_id}/up (or similar health check endpoint)
-/// Basic health check, potentially interacting with metrics.
+
+/// GET /apps/{app_id}/up
+#[instrument(skip(handler), fields(app_id = %app_id))]
 pub async fn up(
     Path(app_id): Path<String>,
     State(handler): State<Arc<ConnectionHandler>>,
-) -> AxumResponse {
-    // Explicit return type
-    Log::info(format!("Health check received for app {}", app_id));
+) -> Result<impl IntoResponse, AppError> {
+    info!("Health check received");
 
-    // --- Metrics Interaction (Optional) ---
-    // Attempt to interact with the metrics system if it's configured.
-    if let Some(metrics_arc) = handler.metrics.clone() {
-        Log::info("Metrics available, attempting to mark connection.");
-        let metrics_data = metrics_arc.lock().await;
-        // Example: Mark a conceptual 'new connection' for health check purposes.
-        // This might need adjustment based on actual metrics logic.
-        Log::info("Metrics interaction complete.");
+    if handler.metrics.is_some() {
+        // **FIXED:** Await the async metric recording function
+        record_api_metrics(&handler, &app_id, 0, 0).await; // Example: Record 0 size for health check
     } else {
-        // Log if metrics system is not available.
-        Log::info("Metrics system not configured for this handler.");
-        // Note: The original code returned a custom response here,
-        // but we proceed to the standard "OK" response below.
-        // If a different response is needed when metrics are off, adjust here.
-        // Example:
-        // return Response::builder()
-        //     .status(StatusCode::OK)
-        //     .body("OK (No metrics)".into()) // Use .into() for Body conversion
-        //     .expect("Failed to build basic OK response");
+        info!("Metrics system not available for health check.")
     }
 
-    // --- Standard OK Response ---
-    // Build a simple OK response. Using expect is generally discouraged in handlers,
-    // prefer proper error handling or Turbofish ::<> if type inference fails.
-    match Response::builder()
+    let response = Response::builder()
         .status(StatusCode::OK)
-        .header("X-Custom-Health", "OK") // Example custom header
-        .body("OK".to_string().into()) // Convert String to Body
-    {
-        Ok(response) => response,
-        Err(e) => {
-            // If building the basic response fails (highly unlikely), return 500.
-            Log::error(format!("Failed to build health check response: {}", e));
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Failed to build health check response"})),
-            )
-                .into_response()
-        }
-    }
+        .header("X-Health-Check", "OK")
+        .body("OK".to_string()) // Simple body
+        .map_err(AppError::HeaderBuildError)?; // Use ? to handle builder error
+
+    Ok(response)
 }
 
+
+/// GET /apps/{app_id}/channels
 /// GET /apps/{app_id}/channels
 /// Retrieves a list or summary of channels within an app.
+#[instrument(skip(handler), fields(app_id = %app_id))]
 pub async fn channels(
     Path(app_id): Path<String>,
     State(handler): State<Arc<ConnectionHandler>>,
-) -> impl IntoResponse {
-    Log::info(format!("Request for channels list: app={}", app_id));
-    // Delegate fetching channels list to the handler.
-    // Assuming `handler.channels` returns data suitable for JSON serialization.
-    let channels_data = handler.channels(app_id.as_str()).await;
-    let metrics = handler.metrics.clone();
-    if let Some(metrics_data) = metrics {
-        Log::info("Metrics available, attempting to mark connection.");
-        let metrics_data = metrics_data.lock().await;
-        let channels_data_size = utils::data_to_bytes_flexible(Vec::from([channels_data.clone()]));
-        // Example: Mark a conceptual 'new connection' for health check purposes.
-        // This might need adjustment based on actual metrics logic.
-        metrics_data.mark_api_message(
-            &app_id,
-            0,                  // Assuming no outgoing message size for this request
-            channels_data_size, // Assuming no incoming message size for this request
-        );
-        Log::info("Metrics interaction complete.");
-    } else {
-        // Log if metrics system is not available.
-        Log::info("Metrics system not configured for this handler.");
-    }
-    // Return the data as JSON.
-    (StatusCode::OK, Json(channels_data))
+) -> Result<impl IntoResponse, AppError> {
+    info!("Request for channels list");
+
+    // Step 1: Await the result from the handler method
+    // Assuming it returns Result<Value, HandlerErrorType> where HandlerErrorType implements Display
+    let channels_result = handler
+        .channels(app_id.as_str())
+        .await;
+
+    // Step 2: Explicitly check the Result *before* trying to map the error
+    let channels_data: Value = channels_result;
+
+    // Now proceed with the channels_data (which is Value)
+    let response_size = utils::data_to_bytes_flexible(Vec::from([channels_data.clone()])); // Propagates potential serialization error
+
+    record_api_metrics(&handler, &app_id, 0, response_size).await; // Await metrics
+
+    info!("Channels list retrieved successfully");
+    Ok((StatusCode::OK, Json(channels_data))) // Return the data
 }
 
+
+/// GET /metrics (Prometheus format)
+#[instrument(skip(handler), fields(service = "metrics_exporter"))]
 pub async fn metrics(
     State(handler): State<Arc<ConnectionHandler>>,
-) -> axum::response::Response<String> {
-    Log::info("Metrics endpoint called");
+) -> Result<impl IntoResponse, AppError> {
+    info!("Metrics endpoint called");
 
-    let metrics_data = match handler.metrics.clone() {
-        Some(metrics_data) => {
-            Log::info("Metrics endpoint");
-            let metrics_data = metrics_data.lock().await;
+    let plaintext_metrics = match handler.metrics.clone() {
+        Some(metrics_arc) => {
+            let metrics_data = metrics_arc.lock().await; // await the lock
+            // Assume get_metrics_as_plaintext returns Result<String, E>
             metrics_data.get_metrics_as_plaintext().await
         }
         None => {
-            return axum::response::Response::builder()
-                .status(200)
-                .header("X-Custom-Foo", "Bar")
-                .body("No metrics available".to_string())
-                .unwrap();
+            info!("No metrics data available.");
+            "# Metrics collection is not enabled.\n".to_string()
         }
     };
 
-    // Simple solution using a tuple
-    Log::info(format!("Metrics: {:?}", metrics_data));
-    let mut headers = HashMap::new();
+    let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; version=0.0.4"),
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
-    axum::response::Response::builder()
-        .status(200)
-        .header("X-Custom-Foo", "Bar")
-        .body(metrics_data)
-        .unwrap()
+
+    info!(bytes = plaintext_metrics.len(), "Successfully generated metrics");
+    Ok((StatusCode::OK, headers, plaintext_metrics))
 }
 
+
 /// GET /apps/{app_id}/channels/{channel_name}/users
-/// Retrieves a list of users in a specific channel within an app.
+#[instrument(skip(handler), fields(app_id = %app_id, channel = %channel_name))]
 pub async fn channel_users(
-    Path((app_id, channel_name)): Path<(String, String)>, // Extract both path params
+    Path((app_id, channel_name)): Path<(String, String)>,
     State(handler): State<Arc<ConnectionHandler>>,
-) -> impl IntoResponse {
-    Log::info(format!(
-        "Request for users in channel: app={}, channel={}",
-        app_id, channel_name
-    ));
-    // Delegate fetching user list to the handler.
-    // Assuming `handler.channel_users` returns data suitable for JSON serialization.
+) -> Result<impl IntoResponse, AppError> {
+    info!("Request for users in channel");
+
     let users_data = handler
         .channel_users(app_id.as_str(), channel_name.as_str())
-        .await.unwrap();
-    
-    let metrics = handler.metrics.clone();
-    if let Some(metrics_data) = metrics {
-        Log::info("Metrics available, attempting to mark connection.");
-        let metrics_data = metrics_data.lock().await;
-        let users_data = serde_json::to_string(&users_data).unwrap_or_default();
-        let users_data_size = users_data.as_bytes().len();
-        // Example: Mark a conceptual 'new connection' for health check purposes.
-        // This might need adjustment based on actual metrics logic.
-        metrics_data.mark_api_message(
-            &app_id,
-            0,                  // Assuming no outgoing message size for this request
-            users_data_size,    // Assuming no incoming message size for this request
-        );
-        Log::info("Metrics interaction complete.");
-    } else {
-        // Log if metrics system is not available.
-        Log::info("Metrics system not configured for this handler.");
-    }
-    let response = json!({ "users": users_data });
-    // Return the data as JSON.
-    (StatusCode::OK, Json(response))
+        .await
+        .map_err(|e| AppError::InternalError(format!("Failed to get channel users: {}", e)))?; // Handle error properly
+
+    let response_payload = json!({ "users": users_data });
+
+    // Use ? to propagate potential serialization error
+    let response_size = serde_json::to_vec(&response_payload)?.len();
+
+    // **FIXED:** Await the async metric recording function
+    record_api_metrics(&handler, &app_id, 0, response_size).await;
+
+    info!(user_count = response_payload["users"].as_array().map_or(0, Vec::len), "Channel users retrieved successfully");
+    Ok((StatusCode::OK, Json(response_payload)))
 }
+
+// --- Definition for utils module (example) ---
+// Put this in `src/utils.rs` and add `pub mod utils;` to `src/lib.rs` or `src/main.rs`
+/*
+pub mod utils {
+    use serde::Serialize;
+    use serde_json;
+    use crate::AppError; // Make AppError accessible if mapping directly
+
+    pub fn is_cache_channel(channel: &str) -> bool {
+        channel.starts_with("cache-") || channel.starts_with("private-cache-")
+    }
+
+    /// Calculates the size in bytes of the JSON representation of the data.
+    pub fn data_to_bytes_flexible<T: Serialize>(data: &T) -> Result<usize, AppError> {
+       serde_json::to_vec(data)
+            .map(|bytes| bytes.len())
+            // Map the serialization error into our AppError::SerializationError
+            .map_err(AppError::SerializationError)
+    }
+}
+*/

@@ -14,16 +14,24 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use uuid::Uuid;
+use crate::metrics::MetricsInterface;
 
 /// Request types for horizontal communication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RequestType {
-    ChannelMembers,
-    ChannelSockets,
-    ChannelSocketsCount,
-    SocketExistsInChannel,
-    TerminateUserConnections,
-    ChannelsWithSocketsCount,
+    // Original request types
+    ChannelMembers,      // Get members in a channel
+    ChannelSockets,      // Get sockets in a channel
+    ChannelSocketsCount, // Get count of sockets in a channel
+    SocketExistsInChannel, // Check if socket exists in a channel
+    TerminateUserConnections, // Terminate user connections
+    ChannelsWithSocketsCount, // Get channels with socket counts
+
+    // New request types
+    Sockets,              // Get all sockets
+    Channels,             // Get all channels
+    SocketsCount,         // Get count of all sockets
+    ChannelMembersCount,  // Get count of members in a channel
 }
 
 /// Request body for horizontal communication
@@ -50,6 +58,7 @@ pub struct ResponseBody {
     pub sockets_count: usize,
     pub exists: bool,
     pub channels: HashSet<String>,
+    pub members_count: usize, // New field for ChannelMembersCount
 }
 
 /// Message for broadcasting events
@@ -83,6 +92,8 @@ pub struct HorizontalAdapter {
 
     /// Timeout for requests in milliseconds
     pub requests_timeout: u64,
+
+    pub metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>,
 }
 
 impl HorizontalAdapter {
@@ -93,6 +104,7 @@ impl HorizontalAdapter {
             local_adapter: LocalAdapter::new(),
             pending_requests: DashMap::new(),
             requests_timeout: 5000, // Default 5 seconds
+            metrics: None,
         }
     }
 
@@ -139,7 +151,7 @@ impl HorizontalAdapter {
 
         // Skip processing our own requests
         if request.node_id == self.node_id {
-            return Err(Error::Other("Ignoring own request".into()));
+            return Err(Error::OwnRequestIgnored);
         }
 
         // Initialize empty response
@@ -152,7 +164,8 @@ impl HorizontalAdapter {
             sockets_count: 0,
             channels_with_sockets_count: HashMap::new(),
             exists: false,
-            channels: Default::default(),
+            channels: HashSet::new(),
+            members_count: 0,
         };
 
         // Process based on request type
@@ -170,11 +183,11 @@ impl HorizontalAdapter {
             RequestType::ChannelSockets => {
                 if let Some(channel) = &request.channel {
                     // Get channel sockets from local adapter
-                    let channel = self
+                    let channel_set = self
                         .local_adapter
                         .get_channel(&request.app_id, channel)
                         .await?;
-                    response.socket_ids = channel
+                    response.socket_ids = channel_set
                         .iter()
                         .map(|socket_id| socket_id.0.clone())
                         .collect();
@@ -210,15 +223,58 @@ impl HorizontalAdapter {
                 }
             }
             RequestType::ChannelsWithSocketsCount => {
+                // Get channels with socket count from local adapter
+                let channels = self
+                    .local_adapter
+                    .get_channels_with_socket_count(&request.app_id)
+                    .await?;
+                response.channels_with_sockets_count = channels
+                    .iter()
+                    .map(|entry| (entry.key().clone(), *entry.value()))
+                    .collect();
+            },
+            // New request types
+            RequestType::Sockets => {
+                // Get all connections for the app
+                let connections = self
+                    .local_adapter
+                    .get_all_connections(&request.app_id)
+                    .await;
+                response.socket_ids = connections
+                    .iter()
+                    .map(|entry| entry.key().0.clone())
+                    .collect();
+                response.sockets_count = connections.len();
+            },
+            RequestType::Channels => {
+                // Get all channels for the app
+                let channels = self
+                    .local_adapter
+                    .get_channels_with_socket_count(&request.app_id)
+                    .await?;
+                response.channels = channels
+                    .iter()
+                    .map(|entry| entry.key().clone())
+                    .collect();
+            },
+            RequestType::SocketsCount => {
+                // Get count of all sockets
+                let connections = self
+                    .local_adapter
+                    .get_all_connections(&request.app_id)
+                    .await;
+                response.sockets_count = connections.len();
+            },
+            RequestType::ChannelMembersCount => {
                 if let Some(channel) = &request.channel {
-                    // Get channels with socket count from local adapter
-                    let channels = self
+                    // Get count of members in a channel
+                    let members = self
                         .local_adapter
-                        .get_channel(&request.app_id, channel)
+                        .get_channel_members(&request.app_id, channel)
                         .await?;
-                    response.sockets_count = channels.len();
+                    response.members_count = members.len();
                 }
-            }
+            },
         }
 
         // Return the response
@@ -226,10 +282,16 @@ impl HorizontalAdapter {
     }
 
     /// Process a response received from another node
-    pub async fn process_response(&mut self, response: ResponseBody) -> Result<()> {
+    pub async fn process_response(&self, response: ResponseBody) -> Result<()> {
+        // Track received response
+        if let Some(metrics_ref) = &self.metrics {
+            let metrics = metrics_ref.lock().await;
+            metrics.mark_horizontal_adapter_response_received(&response.app_id);
+        }
+
         // Get the pending request
         if let Some(mut request) = self.pending_requests.get_mut(&response.request_id) {
-            // Add response to the list - now works with the mut binding
+            // Add response to the list
             request.responses.push(response);
         }
 
@@ -272,6 +334,10 @@ impl HorizontalAdapter {
 
         // Serialize the request
         let request_json = serde_json::to_string(&request)?;
+        if let Some(metrics_ref) = &self.metrics {
+            let metrics = metrics_ref.lock().await;
+            metrics.mark_horizontal_adapter_request_sent(app_id);
+        }
 
         // This would be implemented by the specific adapter (Redis, etc.)
         // self.broadcast_request(request_json).await?;
@@ -298,6 +364,7 @@ impl HorizontalAdapter {
             channels_with_sockets_count: HashMap::new(),
             exists: false,
             channels: Default::default(),
+            members_count:0 ,
         };
 
         // Wait for responses until timeout or we have enough responses
@@ -342,6 +409,16 @@ impl HorizontalAdapter {
                         .or_insert_with(|| 0);
                 }
             }
+        }
+        if let Some(metrics_ref) = &self.metrics {
+            let duration_ms = start.elapsed().as_millis() as f64;
+            let metrics = metrics_ref.lock().await;
+
+            // Track resolution time
+            metrics.track_horizontal_adapter_resolve_time(app_id, duration_ms);
+
+            // Track if the request was successfully resolved
+            metrics.track_horizontal_adapter_resolved_promises(app_id, true);
         }
 
         // Return the combined response

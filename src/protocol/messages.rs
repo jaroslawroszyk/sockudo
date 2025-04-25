@@ -52,6 +52,11 @@ pub struct PusherApiMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchPusherApiMessage {
+    pub batch: Vec<PusherApiMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ApiMessageData {
     String(String),

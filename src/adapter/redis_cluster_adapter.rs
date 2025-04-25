@@ -368,7 +368,7 @@ impl RedisClusterAdapter {
                                 }
                                 // Process the response (already designed to be async)
                                 // Lock only when processing
-                                let mut horizontal_lock = horizontal_clone.lock().await;
+                                let horizontal_lock = horizontal_clone.lock().await;
                                 let _ = horizontal_lock.process_response(response).await;
                                 // Lock released automatically
                             }

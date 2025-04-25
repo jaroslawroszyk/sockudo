@@ -23,6 +23,7 @@ use crate::app::manager::AppManager;
 use crate::channel::PresenceMemberInfo;
 use crate::error::{Error, Result};
 use crate::log::Log;
+use crate::metrics::MetricsInterface;
 use crate::namespace::Namespace;
 use crate::protocol::messages::PusherMessage;
 use crate::websocket::{SocketId, WebSocket, WebSocketRef};
@@ -130,6 +131,29 @@ impl RedisAdapter {
         };
 
         Ok(adapter)
+    }
+
+    pub async fn set_metrics(&mut self, metrics: Arc<Mutex<dyn MetricsInterface + Send + Sync>>) -> Result<()> {
+        // Get lock on the horizontal adapter
+        let mut horizontal = self.horizontal.lock().await;
+
+        // Set the metrics in horizontal adapter
+        horizontal.metrics = Some(metrics);
+
+        Ok(())
+    }
+
+    // Method to initialize metrics during adapter startup
+    pub async fn init_with_metrics(&mut self, metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>) -> Result<()> {
+        // First initialize the adapter
+        self.init().await;
+
+        // If metrics are provided, set them in the horizontal adapter
+        if let Some(metrics_instance) = metrics {
+            self.set_metrics(metrics_instance).await?;
+        }
+
+        Ok(())
     }
 
     /// Create a new Redis adapter with simple configuration

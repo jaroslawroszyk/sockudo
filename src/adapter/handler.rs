@@ -126,6 +126,10 @@ impl ConnectionHandler {
         {
             match frame.opcode {
                 OpCode::Close => {
+                    if let Some(ref metrics) = self.metrics {
+                        let mut metrics = metrics.lock().await;
+                        metrics.mark_disconnection(&app.id, &socket_id);
+                    }
                     if let Err(e) = self.handle_disconnect(&app.id, &socket_id).await {
                         Log::error(format!("Disconnect error for socket {}: {}", socket_id, e));
                     }
@@ -221,7 +225,7 @@ impl ConnectionHandler {
         }
         
         if let Some(ref metrics) = self.metrics {
-            let mut metrics = metrics.lock().await;
+            let metrics = metrics.lock().await;
             let message_size = frame.payload.len();
             metrics.mark_ws_message_received(
                 &app.id,
@@ -456,10 +460,21 @@ impl ConnectionHandler {
         message: &PusherMessage,
         app_id: &str,
     ) -> Result<()> {
-        let channel_name = message
-            .channel
+        println!("handle_unsubscribe: {:?}", message);
+        let data = message
+            .data
             .as_ref()
-            .ok_or_else(|| Error::ChannelError("Channel name is required".into()))?;
+            .ok_or_else(|| Error::InvalidMessageFormat("Missing data in unsubscribe message".into()))?;
+        let channel_name = match data {
+            MessageData::String(channel) => channel,
+            MessageData::Json(data) => data
+                .get("channel")
+                .and_then(Value::as_str)
+                .ok_or_else(|| Error::InvalidMessageFormat("Missing channel in unsubscribe message".into()))?,
+            MessageData::Structured { channel, .. } => channel
+                .as_ref()
+                .ok_or_else(|| Error::InvalidMessageFormat("Missing channel in unsubscribe message".into()))?,
+        };
 
         let channel_type = ChannelType::from_name(channel_name);
 
@@ -916,6 +931,7 @@ impl ConnectionHandler {
         message: PusherApiMessage,
         channel: &str,
     ) {
+        // Create PusherMessage
         let message = PusherMessage {
             event: message.name,
             data: Option::from(MessageData::Json(
@@ -925,6 +941,17 @@ impl ConnectionHandler {
             name: None,
         };
 
+        // Track message metrics before sending
+        if let Some(ref metrics) = self.metrics {
+            let mut metrics = metrics.lock().await;
+            let message_size = match serde_json::to_string(&message) {
+                Ok(msg_str) => msg_str.len(),
+                Err(_) => 0,
+            };
+            metrics.mark_ws_message_sent(app_id, message_size);
+        }
+
+        // Send the message
         match self
             .connection_manager
             .lock()
