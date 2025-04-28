@@ -153,6 +153,18 @@ impl CacheManager for RedisCacheManager {
             Err(_) => Ok(false),
         }
     }
+    async fn ttl(&mut self, key: &str) -> Result<Option<Duration>> {
+        let ttl: i64 = self
+            .connection
+            .ttl(self.prefixed_key(key))
+            .await
+            .map_err(|e| Error::CacheError(format!("Redis TTL error: {}", e)))?;
+        if ttl > 0 {
+            Ok(Some(Duration::from_secs(ttl as u64)))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 // Additional utility methods for the cache manager
@@ -234,14 +246,7 @@ impl RedisCacheManager {
     }
 
     /// Get the remaining TTL for a key in seconds
-    pub async fn ttl(&mut self, key: &str) -> Result<i64> {
-        let ttl: i64 = self
-            .connection
-            .ttl(self.prefixed_key(key))
-            .await
-            .map_err(|e| Error::CacheError(format!("Redis TTL error: {}", e)))?;
-        Ok(ttl)
-    }
+
 
     /// Get multiple keys at once
     pub async fn get_many(&mut self, keys: &[&str]) -> Result<Vec<Option<String>>> {

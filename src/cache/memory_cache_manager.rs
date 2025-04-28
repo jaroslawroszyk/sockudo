@@ -176,6 +176,16 @@ impl CacheManager for MemoryCacheManager {
         // Moka cache is generally always "healthy" unless the process runs out of memory.
         Ok(true)
     }
+    
+    async fn ttl(&mut self, key: &str) -> Result<Option<Duration>> {
+        let prefixed_key = self.prefixed_key(key);
+        // Moka doesn't expose TTL directly, but we can check if the key exists
+        if self.cache.contains_key(&prefixed_key) {
+            Ok(Some(self.config.default_ttl.unwrap_or_default()))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 // Drop implementation is no longer needed for cleanup task management.

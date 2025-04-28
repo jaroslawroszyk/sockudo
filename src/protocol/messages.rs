@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -49,6 +50,8 @@ pub struct PusherApiMessage {
     pub channels: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub socket_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub info: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,16 +108,7 @@ impl From<String> for MessageData {
 
 impl From<Value> for MessageData {
     fn from(v: Value) -> Self {
-        MessageData::Structured {
-            channel_data: None,
-            channel: None,
-            user_data: None,
-            extra: {
-                let mut map = HashMap::new();
-                map.insert("data".to_string(), v);
-                map
-            },
-        }
+        MessageData::Json(v)
     }
 }
 
@@ -127,7 +121,7 @@ impl PusherMessage {
                     "socket_id": socket_id,
                     "activity_timeout": 120
                 })
-                .to_string(),
+                    .to_string(),
             )),
             channel: None,
             name: None,
@@ -187,5 +181,92 @@ impl PusherMessage {
             data: Some(MessageData::Json(json!({ "user_id": user_id }))),
             name: None,
         }
+    }
+
+    // New helper method for pong response
+    pub fn pong() -> Self {
+        Self {
+            event: Some("pusher:pong".to_string()),
+            data: None,
+            channel: None,
+            name: None,
+        }
+    }
+
+    // Helper for creating channel info response
+    pub fn channel_info(occupied: bool, subscription_count: Option<u64>, user_count: Option<u64>, cache_data: Option<(String, Duration)>) -> Value {
+        let mut response = json!({
+            "occupied": occupied
+        });
+
+        if let Some(count) = subscription_count {
+            response["subscription_count"] = json!(count);
+        }
+
+        if let Some(count) = user_count {
+            response["user_count"] = json!(count);
+        }
+
+        if let Some((data, ttl)) = cache_data {
+            response["cache"] = json!({
+                "data": data,
+                "ttl": ttl
+            });
+        }
+
+        response
+    }
+
+    // Helper for creating channels list response
+    pub fn channels_list(channels_info: HashMap<String, Value>) -> Value {
+        json!({
+            "channels": channels_info
+        })
+    }
+
+    // Helper for creating user list response
+    pub fn user_list(user_ids: Vec<String>) -> Value {
+        let users = user_ids.into_iter()
+            .map(|id| json!({ "id": id }))
+            .collect::<Vec<_>>();
+
+        json!({ "users": users })
+    }
+
+    // Helper for batch events response
+    pub fn batch_response(batch_info: Vec<Value>) -> Value {
+        json!({ "batch": batch_info })
+    }
+
+    // Helper for simple success response
+    pub fn success_response() -> Value {
+        json!({ "ok": true })
+    }
+}
+
+// Add a helper extension trait for working with info parameters
+pub trait InfoQueryParser {
+    fn parse_info(&self) -> Vec<&str>;
+    fn wants_user_count(&self) -> bool;
+    fn wants_subscription_count(&self) -> bool;
+    fn wants_cache(&self) -> bool;
+}
+
+impl InfoQueryParser for Option<&String> {
+    fn parse_info(&self) -> Vec<&str> {
+        self.map(|s| s.split(',').collect::<Vec<_>>())
+            .unwrap_or_default()
+    }
+
+    fn wants_user_count(&self) -> bool {
+        self.parse_info().contains(&"user_count")
+    }
+
+    fn wants_subscription_count(&self) -> bool {
+        self.parse_info().contains(&"subscription_count")
+    }
+
+    fn wants_cache(&self) -> bool {
+        self.parse_info().contains(&"cache")
     }
 }

@@ -21,4 +21,5 @@ pub trait CacheManager: Send + Sync {
     async fn is_healthy(&self) -> Result<bool> {
         Ok(true)
     }
+    async fn ttl(&mut self, key: &str) -> Result<Option<Duration>>;
 }

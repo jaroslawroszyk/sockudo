@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct App {
     pub id: String,
     pub key: String,
@@ -60,27 +61,3 @@ where
 }
 
 // Implementation with default values
-impl Default for App {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            key: String::new(),
-            secret: String::new(),
-            max_connections: 0,
-            enable_client_messages: false,
-            enabled: false,
-            max_backend_events_per_second: None,
-            max_client_events_per_second: 0,
-            max_read_requests_per_second: None,
-            max_presence_members_per_channel: None,
-            max_presence_member_size_in_kb: None,
-            max_channel_name_length: None,
-            max_event_channels_at_once: None,
-            max_event_name_length: None,
-            max_event_payload_in_kb: None,
-            max_event_batch_size: None,
-            enable_user_authentication: None,
-            webhooks: None,
-        }
-    }
-}
