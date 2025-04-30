@@ -57,6 +57,8 @@ use crate::error::Result;
 use crate::http_handler::{batch_events, channel, channel_users, channels, events, metrics, terminate_user_connections, up, usage};
 use crate::log::Log;
 use crate::metrics::{MetricsFactory, MetricsInterface};
+use crate::options::WebhooksConfig;
+use crate::webhook::integration::{WebhookConfig, WebhookIntegration};
 use crate::ws_handler::handle_ws_upgrade;
 
 /// Server configuration struct
@@ -86,6 +88,7 @@ struct ServerState {
     connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>>,
     auth_validator: Arc<AuthValidator>,
     cache_manager: Arc<Mutex<dyn CacheManager + Send + Sync>>,
+    webhooks_integration: Arc<WebhookIntegration>,
     metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>,
     running: Arc<AtomicBool>,
 }
@@ -138,6 +141,18 @@ impl SockudoServer {
             metrics::PrometheusMetricsDriver::new(config.metrics_addr.port(), Some("sockudo"))
                 .await,
         ));
+        let webhook_config = WebhookConfig {
+            enabled: true,
+            batching: Default::default(),
+            queue_driver: "redis".to_string(),
+            redis_url: Some("redis://127.0.0.1:6379".to_string()),
+            redis_prefix: Some("redis".to_string()),
+            redis_concurrency: Some(8),
+            process_id: "".to_string(),
+            debug: false,
+        };
+
+        let webhook_integration = Arc::new(WebhookIntegration::new(webhook_config).await?);
 
         // Initialize the state
         let state = ServerState {
@@ -146,6 +161,7 @@ impl SockudoServer {
             connection_manager: connection_manager.clone(),
             auth_validator,
             cache_manager: Arc::new(Mutex::new(cache_manager)),
+            webhooks_integration: webhook_integration,
             metrics: Some(metrics_driver.clone()),
             running: Arc::new(AtomicBool::new(true)),
         };
@@ -157,6 +173,7 @@ impl SockudoServer {
             state.connection_manager.clone(),
             state.cache_manager.clone(),
             state.metrics.clone(),
+            Some(state.webhooks_integration.clone())
         ));
 
         Ok(Self {

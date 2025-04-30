@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use crate::webhook::integration::WebhookIntegration;
 
 pub struct ConnectionHandler {
     pub(crate) app_manager: Arc<dyn AppManager + Send + Sync>,
@@ -25,6 +26,7 @@ pub struct ConnectionHandler {
     pub(crate) connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>>,
     pub(crate) cache_manager: Arc<Mutex<dyn CacheManager + Send + Sync>>,
     pub(crate) metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>,
+    pub(crate) webhook_integration: Option<Arc<WebhookIntegration>>,
 }
 
 impl ConnectionHandler {
@@ -34,6 +36,7 @@ impl ConnectionHandler {
         connection_manager: Arc<Mutex<Box<dyn Adapter + Send + Sync>>>,
         cache_manager: Arc<Mutex<dyn CacheManager + Send + Sync>>,
         metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>,
+        webhook_integration: Option<Arc<WebhookIntegration>>,
     ) -> Self {
         Self {
             app_manager,
@@ -41,6 +44,30 @@ impl ConnectionHandler {
             connection_manager,
             cache_manager,
             metrics,
+            webhook_integration
+        }
+    }
+
+    async fn send_webhook<F, Fut>(&self, app: &App, webhook_fn: F) -> Result<()>
+    where
+        F: FnOnce(&WebhookIntegration, &App) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
+        if let Some(webhook) = &self.webhook_integration {
+            if webhook.is_enabled() {
+                match webhook_fn(webhook, app).await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        // Log the error but don't fail the operation
+                        Log::warning(format!("Webhook event failed: {}", e));
+                        Ok(())
+                    }
+                }
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
         }
     }
 
@@ -62,7 +89,20 @@ impl ConnectionHandler {
                     .send_message(app_id, socket_id, cache_message)
                     .await?;
             }
-            _ => {
+            None => {
+                let message = PusherMessage {
+                    channel: Some(channel.to_string()),
+                    name: None,
+                    event: Some("pusher:cache_miss".parse().unwrap()),
+                    data: None,
+                };
+                self.connection_manager
+                    .lock()
+                    .await
+                    .send_message(app_id, socket_id, message)
+                    .await?;
+                let app = self.app_manager.get_app(app_id).await?;
+                self.webhook_integration.clone().unwrap().send_cache_missed(&app.unwrap(),channel).await?;
                 Log::info(format!("No missed cache for channel: {}", channel));
             }
         }
@@ -74,6 +114,8 @@ impl ConnectionHandler {
         fut: upgrade::UpgradeFut,
         app_key: String,
         metrics: Option<Arc<Mutex<dyn MetricsInterface + Send + Sync>>>,
+        webhook_integration: Option<Arc<WebhookIntegration>>,
+
     ) -> Result<()> {
         // Get app by key - this needs to handle both sync and potentially async implementations
         let app = self.app_manager.get_app_by_key(&app_key).await?;
@@ -127,7 +169,7 @@ impl ConnectionHandler {
             match frame.opcode {
                 OpCode::Close => {
                     if let Some(ref metrics) = self.metrics {
-                        let mut metrics = metrics.lock().await;
+                        let metrics = metrics.lock().await;
                         metrics.mark_disconnection(&app.id, &socket_id);
                     }
                     if let Err(e) = self.handle_disconnect(&app.id, &socket_id).await {
@@ -223,7 +265,7 @@ impl ConnectionHandler {
                 event, e
             )));
         }
-        
+
         if let Some(ref metrics) = self.metrics {
             let metrics = metrics.lock().await;
             let message_size = frame.payload.len();
@@ -306,7 +348,7 @@ impl ConnectionHandler {
                 return Err(Error::AuthError("Authentication required".into()));
             }
 
-            channel_manager.signature_is_valid(app.unwrap(), socket_id, &signature, message.clone())
+            channel_manager.signature_is_valid(app.clone().unwrap(), socket_id, &signature, message.clone())
         };
 
         // Subscribe to channel with write lock
@@ -336,6 +378,11 @@ impl ConnectionHandler {
                     Some(channel.to_string()),
                 )
                 .await;
+        }
+
+        if subscription_result.channel_connections.unwrap() == 1 {
+            let app = app.clone().unwrap();
+            self.webhook_integration.clone().unwrap().send_channel_occupied(&app, channel).await?;
         }
 
         // Update adapter state with presence information if needed
@@ -393,6 +440,7 @@ impl ConnectionHandler {
                     let members = connection_manager
                         .get_channel_members(app_id, channel)
                         .await?;
+                    self.webhook_integration.clone().unwrap().send_member_added(&app.clone().unwrap(), channel, user_id).await?;
 
                     let member_added = PusherMessage::member_added(
                         channel.to_string(),
@@ -517,7 +565,9 @@ impl ConnectionHandler {
 
                         // send member removal within the same lock
                         let member_removed =
-                            PusherMessage::member_removed(channel_name.to_string(), member.user_id);
+                            PusherMessage::member_removed(channel_name.to_string(), member.clone().user_id);
+                        let app = self.app_manager.get_app(app_id).await?;
+                        self.webhook_integration.clone().unwrap().send_member_removed(&app.unwrap(), channel_name, member.user_id.as_str()).await?;
 
                         conn_manager
                             .send(channel_name, member_removed, Some(socket_id), app_id)
@@ -532,13 +582,17 @@ impl ConnectionHandler {
             _ => {
                 // Simple unsubscribe for non-presence channels
                 let channel_manager = self.channel_manager.write().await;
-                channel_manager
+                let response = channel_manager
                     .unsubscribe(socket_id.0.as_str(), channel_name, app_id, None)
                     .await
                     .map_err(|e| {
                         Log::error(format!("Error unsubscribing: {:?}", e));
                         e
                     })?;
+                if response.remaining_connections == Some(0) {
+                    let app = self.app_manager.get_app(app_id).await?;
+                    self.webhook_integration.clone().unwrap().send_channel_vacated(&app.unwrap(), channel_name).await?;
+                }
             }
         }
 
@@ -730,6 +784,8 @@ impl ConnectionHandler {
                 .await?
         };
 
+        let mut connection_manager = self.connection_manager.lock().await;
+        let connection = connection_manager.get_connection(socket_id, app_id).await.unwrap();
         // If not subscribed, log and return error
         if !is_subscribed {
             // Check if there's a mismatch in the channel name
@@ -756,12 +812,20 @@ impl ConnectionHandler {
             data: Some(MessageData::Json(data)),
         };
 
+
         // send message in a single lock scope
         self.connection_manager
             .lock()
             .await
-            .send(channel_name, message, Some(socket_id), app_id)
-            .await
+            .send(channel_name, message.clone(), Some(socket_id), app_id)
+            .await;
+        let app = self.app_manager.get_app(app_id).await?;
+        let value = serde_json::to_value(&message.data)?;
+        if let Some(presence) = connection.lock().await.state.presence.clone().unwrap().get(channel_name) {
+            let user_id =  &presence.user_id;
+            self.webhook_integration.clone().unwrap().send_client_event(&app.unwrap(), channel_name, message.event.unwrap().as_str(), value, Some(socket_id.as_ref()), Some(&*user_id)).await;
+        }
+        return Ok(());
     }
 
     async fn send_error(

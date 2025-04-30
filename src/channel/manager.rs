@@ -40,8 +40,8 @@ pub struct JoinResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaveResponse {
     pub(crate) left: bool,
-    remaining_connections: Option<usize>,
-    member: Option<PresenceMember>,
+    pub remaining_connections: Option<usize>,
+    pub member: Option<PresenceMember>,
 }
 
 pub struct ChannelManager {
@@ -237,7 +237,7 @@ impl ChannelManager {
         format!(
             "{}:{}",
             app_config.key,
-            token.sign(&*Self::get_data_to_sign_for_signature(socket_id, message))
+            token.sign(&Self::get_data_to_sign_for_signature(socket_id, message))
         )
     }
 

@@ -22,10 +22,11 @@ pub async fn handle_ws_upgrade(
 ) -> impl IntoResponse {
     let (response, fut) = ws.upgrade().unwrap();
     let metrics = handler.metrics.clone();
+    let webhook = handler.webhook_integration.clone();
     let apps = handler.app_manager.get_apps().await;
     println!("{:?}", apps.unwrap());
     tokio::task::spawn(async move {
-        if let Err(e) = handler.handle_socket(fut, app_key, metrics).await {
+        if let Err(e) = handler.handle_socket(fut, app_key, metrics, webhook).await {
             Log::error(format!("Error handling socket: {}", e));
         }
     });

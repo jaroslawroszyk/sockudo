@@ -4,5 +4,6 @@ mod horizontal_adapter;
 pub mod local_adapter;
 pub mod redis_adapter;
 mod redis_cluster_adapter;
+mod nats_adapter;
 
 pub use self::{adapter::Adapter, handler::ConnectionHandler};
