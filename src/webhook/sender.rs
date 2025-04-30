@@ -3,7 +3,6 @@ use crate::channel::ChannelType;
 use crate::error::Result;
 use crate::log::Log;
 use crate::token::Token;
-use crate::webhook::queue::QueueManager;
 use crate::webhook::types::{AppWebhook, ClientEventData, JobData, JobPayload, WebhookEvent};
 use async_trait::async_trait;
 use hmac::KeyInit;
@@ -16,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
+use crate::queue::manager::QueueManager;
 
 type HmacSha256 = Hmac<Sha256>;
 

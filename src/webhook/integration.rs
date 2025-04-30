@@ -1,9 +1,9 @@
 use crate::app::config::App;
 use crate::error::Result;
 use crate::log::Log;
-use crate::webhook::queue::{QueueManager, QueueManagerFactory};
 use crate::webhook::sender::{WebhookSender, WebhookSenderConfig};
 use std::sync::Arc;
+use crate::queue::manager::{QueueManager, QueueManagerFactory};
 
 /// Webhook server configuration
 #[derive(Debug, Clone)]

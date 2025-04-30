@@ -10,8 +10,8 @@
       "secret": "secret1",
       "enable_client_messages": true,
       "enabled": true,
-      "max_connections": 100,
-      "max_client_events_per_second": 10
+      "max_connections": "100",
+      "max_client_events_per_second": "10"
     },
     {
       "id": "app2",
@@ -19,13 +19,13 @@
       "secret": "secret2",
       "enable_client_messages": false,
       "enabled": true,
-      "max_connections": 50,
-      "max_client_events_per_second": 5
+      "max_connections": "50",
+      "max_client_events_per_second": "5"
     }
   ],
   "adapter.driver": "redis",
   "adapter.redis.prefix": "sockudo",
-  "adapter.redis.requests_timeout": 5000,
+  "adapter.redis.requests_timeout": "5000",
   "cache.driver": "redis",
   "cache.redis.url": "redis://localhost:6379"
 }

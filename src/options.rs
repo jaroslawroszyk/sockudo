@@ -2,6 +2,7 @@ use crate::app::config::App;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerOptions {
     pub adapter: AdapterConfig,
@@ -28,6 +29,28 @@ pub struct ServerOptions {
     pub ssl: SslConfig,
     pub user_authentication_timeout: u64,
     pub webhooks: WebhooksConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqsQueueConfig {
+    /// AWS region
+    pub region: String,
+    /// URL prefix for SQS queues, omitting queue name
+    pub queue_url_prefix: Option<String>,
+    /// Visibility timeout in seconds (how long a message is invisible after being received)
+    pub visibility_timeout: i32,
+    /// Optional endpoint URL (for local testing with LocalStack)
+    pub endpoint_url: Option<String>,
+    /// How many messages to receive at once
+    pub max_messages: i32,
+    /// Wait time in seconds for long polling (0-20)
+    pub wait_time_seconds: i32,
+    /// Processing concurrency per queue
+    pub concurrency: u32,
+    /// Use standard queue (false) or FIFO queue (true)
+    pub fifo: bool,
+    /// Message group ID for FIFO queues
+    pub message_group_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +243,7 @@ pub struct PresenceConfig {
 pub struct QueueConfig {
     pub driver: String,
     pub redis: RedisQueueConfig,
+    pub sqs: SqsQueueConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,6 +350,22 @@ impl Default for ServerOptions {
             shutdown_grace_period: 10,
             // Initialize other fields with sensible defaults
             ..Default::default() // This requires implementing Default for all sub-structs
+        }
+    }
+}
+
+impl Default for SqsQueueConfig {
+    fn default() -> Self {
+        Self {
+            region: "us-east-1".to_string(),
+            queue_url_prefix: None,
+            visibility_timeout: 30,
+            endpoint_url: None,
+            max_messages: 10,
+            wait_time_seconds: 5,
+            concurrency: 5,
+            fifo: false,
+            message_group_id: Some("default".to_string()),
         }
     }
 }

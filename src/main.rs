@@ -15,6 +15,7 @@ pub mod utils;
 mod webhook;
 mod websocket;
 mod ws_handler;
+mod queue;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -32,7 +33,7 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
-use serde_json::{from_str, Value};
+use serde_json::{from_str, json, Value};
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{Mutex, RwLock};
@@ -40,7 +41,7 @@ use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
+use tracing_subscriber::fmt::format;
 use crate::adapter::local_adapter::LocalAdapter;
 use crate::adapter::redis_adapter::{RedisAdapter, RedisAdapterConfig};
 use crate::adapter::Adapter;
@@ -436,6 +437,7 @@ impl SockudoServer {
 
     /// Handle apps configuration
     async fn handle_apps_configuration(&mut self, parts: &[&str], value: Value) -> Result<()> {
+        println!("{:?}, {:?}", parts, value);
         if parts.is_empty() {
             // Handle setting entire apps array
             if let Value::Array(apps_array) = value {
@@ -443,6 +445,14 @@ impl SockudoServer {
                 let mut apps = Vec::new();
 
                 for app_value in apps_array {
+                    match serde_json::from_value::<App>(app_value.clone())  {
+                        Ok(app) => {
+                            
+                        }
+                        Err(e) => {
+                            println!("Invalid app configuration: {}", e);
+                        }
+                    }
                     if let Ok(app) = serde_json::from_value::<App>(app_value) {
                         apps.push(app);
                     } else {
@@ -459,7 +469,7 @@ impl SockudoServer {
 
         // Handle individual app settings
         // parts[0] should be the index of the app
-        if let Some(index_str) = parts.get(0) {
+        if let Some(index_str) = parts.first() {
             if let Ok(index) = index_str.parse::<usize>() {
                 // Handle operations on a specific app
                 if parts.len() > 1 {
@@ -670,7 +680,21 @@ async fn main() -> Result<()> {
     };
 
     // Create and start the server
-    let server = SockudoServer::new(config).await?;
+    let mut server = SockudoServer::new(config).await?;
+
+    server.load_options_from_file("src/config.json").await?;
+
+    // // Or set options programmatically
+    // let mut options = HashMap::new();
+    // options.insert("app_manager.array.apps.0.id".to_string(), json!("demo-app"));
+    // options.insert("app_manager.array.apps.0.key".to_string(), json!("demo-key"));
+    // options.insert("app_manager.array.apps.0.secret".to_string(), json!("demo-secret"));
+    // options.insert("app_manager.array.apps.0.enable_client_messages".to_string(), json!(true));
+    // options.insert("port".to_string(), json!(6001));
+    // options.insert("debug".to_string(), json!(true));
+
+    // server.set_options(options).await?;
+
 
     // Start the server and await completion
     server.start().await?;
