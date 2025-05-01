@@ -11,7 +11,13 @@
       "enable_client_messages": true,
       "enabled": true,
       "max_connections": "100",
-      "max_client_events_per_second": "10"
+      "max_client_events_per_second": "10",
+      "webhooks" : [
+        {
+          "url": "http://localhost:3000/webhook",
+          "event_types": ["member_added", "member_removed"]
+        }
+      ]
     },
     {
       "id": "app2",
@@ -27,5 +33,13 @@
   "adapter.redis.prefix": "sockudo",
   "adapter.redis.requests_timeout": "5000",
   "cache.driver": "redis",
-  "cache.redis.url": "redis://localhost:6379"
+  "cache.redis.url": "redis://localhost:6379",
+
+  "webhooks.enabled": true,
+  "webhooks.queue.driver": "redis",
+  "webhooks.queue.redis.url": "redis://localhost:6379",
+  "webhooks.queue.redis.prefix": "sockudo",
+  "webhooks.queue.redis.concurrency": "5",
+  "webhooks.batching.enabled": false,
+  "webhooks.batching.duration": "50"
 }

@@ -34,6 +34,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
 use serde_json::{from_str, json, Value};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{Mutex, RwLock};
@@ -57,28 +58,11 @@ use crate::error::Result;
 use crate::http_handler::{batch_events, channel, channel_users, channels, events, metrics, terminate_user_connections, up, usage};
 use crate::log::Log;
 use crate::metrics::{MetricsFactory, MetricsInterface};
-use crate::options::WebhooksConfig;
-use crate::webhook::integration::{WebhookConfig, WebhookIntegration};
+use crate::options::{ServerOptions, WebhooksConfig};
+use crate::webhook::integration::{WebhookConfig, WebhookIntegration, BatchingConfig};
+use crate::webhook::types::Webhook;
 use crate::ws_handler::handle_ws_upgrade;
 
-/// Server configuration struct
-#[derive(Clone)]
-struct ServerConfig {
-    http_addr: SocketAddr,
-    metrics_addr: SocketAddr,
-    debug: bool,
-    // Additional configuration options can be added here
-}
-
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            http_addr: "127.0.0.1:6001".parse().unwrap(),
-            metrics_addr: "127.0.0.1:9601".parse().unwrap(),
-            debug: false,
-        }
-    }
-}
 
 /// Server state containing all managers
 #[derive(Clone)]
@@ -95,19 +79,52 @@ struct ServerState {
 
 /// Main server struct
 struct SockudoServer {
-    config: ServerConfig,
+    config: ServerOptions,
     state: ServerState,
     handler: Arc<ConnectionHandler>,
 }
 
 impl SockudoServer {
+    /// Get HTTP address from ServerOptions
+    fn get_http_addr(&self) -> SocketAddr {
+        format!("{}:{}", self.config.host, self.config.port)
+            .parse()
+            .unwrap_or_else(|_| "127.0.0.1:6001".parse().unwrap())
+    }
+
+    /// Get metrics address from ServerOptions
+    fn get_metrics_addr(&self) -> SocketAddr {
+        format!("{}:{}", self.config.metrics.host, self.config.metrics.port)
+            .parse()
+            .unwrap_or_else(|_| "127.0.0.1:9601".parse().unwrap())
+    }
+
     /// Create a new server instance
-    async fn new(config: ServerConfig) -> Result<Self> {
+    async fn new(config: ServerOptions) -> Result<Self> {
         // Initialize app manager
         let app_manager = Arc::new(MemoryAppManager::new());
 
+        // Get Redis URL from adapter config or fallback
+        let redis_url = match config.adapter.driver.as_str() {
+            "redis" => {
+                if let Some(url) = config.adapter.redis.redis_pub_options.get("url") {
+                    url.as_str().unwrap_or("redis://127.0.0.1:6379").to_string()
+                } else {
+                    "redis://127.0.0.1:6379".to_string()
+                }
+            },
+            _ => "redis://127.0.0.1:6379".to_string()
+        };
+
         // Initialize Redis adapter with configuration
-        let adapter_config = RedisAdapterConfig::default();
+        let adapter_config = RedisAdapterConfig {
+            url: redis_url.clone(),
+            prefix: config.adapter.redis.prefix.clone(),
+            request_timeout_ms: config.adapter.redis.requests_timeout,
+            use_connection_manager: true,
+            cluster_mode: config.adapter.redis.cluster_mode,
+        };
+
         let connection_manager: Box<dyn Adapter + Send + Sync> =
             match RedisAdapter::new(adapter_config).await {
                 Ok(adapter) => {
@@ -126,8 +143,32 @@ impl SockudoServer {
         // Initialize the connection manager
         let connection_manager = Arc::new(Mutex::new(connection_manager));
 
-        // Initialize cache manager
-        let cache_manager = RedisCacheManager::new(RedisCacheConfig::default()).await?;
+        // Initialize cache manager with Redis configuration
+        let cache_config = RedisCacheConfig {
+            url: redis_url.clone(),
+            prefix: match config.cache.driver.as_str() {
+                "redis" => {
+                    if let Some(prefix) = config.cache.redis.redis_options.get("prefix") {
+                        prefix.as_str().unwrap_or("cache").to_string()
+                    } else {
+                        "cache".to_string()
+                    }
+                },
+                _ => "cache".to_string()
+            },
+            ..RedisCacheConfig::default()
+        };
+
+        let cache_manager = match RedisCacheManager::new(cache_config).await {
+            Ok(manager) => {
+                info!("Using Redis cache manager");
+                manager
+            },
+            Err(e) => {
+                warn!("Failed to initialize Redis cache: {}", e);
+                return Err(e);
+            }
+        };
 
         // Initialize channel manager
         let channel_manager =
@@ -138,21 +179,42 @@ impl SockudoServer {
 
         // Initialize metrics
         let metrics_driver = Arc::new(Mutex::new(
-            metrics::PrometheusMetricsDriver::new(config.metrics_addr.port(), Some("sockudo"))
+            metrics::PrometheusMetricsDriver::new(config.metrics.port, Some(&config.metrics.prometheus.prefix))
                 .await,
         ));
+
+        // Initialize webhook integration
         let webhook_config = WebhookConfig {
-            enabled: true,
-            batching: Default::default(),
-            queue_driver: "redis".to_string(),
-            redis_url: Some("redis://127.0.0.1:6379".to_string()),
-            redis_prefix: Some("redis".to_string()),
-            redis_concurrency: Some(8),
-            process_id: "".to_string(),
-            debug: false,
+            enabled: config.webhooks.batching.enabled,
+            batching: BatchingConfig {
+                enabled: config.webhooks.batching.enabled,
+                duration: config.webhooks.batching.duration,
+            },
+            queue_driver: config.queue.driver.clone(),
+            redis_url: Some(redis_url.clone()),
+            redis_prefix: Some(config.adapter.redis.prefix.clone()),
+            redis_concurrency: Some(config.queue.redis.concurrency as usize),
+            process_id: uuid::Uuid::new_v4().to_string(),
+            debug: config.debug,
         };
 
-        let webhook_integration = Arc::new(WebhookIntegration::new(webhook_config).await?);
+        // Initialize webhook integration with proper error handling
+        let webhook_integration = match WebhookIntegration::new(webhook_config).await {
+            Ok(integration) => {
+                info!("Webhook integration initialized successfully");
+                Arc::new(integration)
+            },
+            Err(e) => {
+                warn!("Failed to initialize webhook integration: {}, webhooks will be disabled", e);
+                // Create a disabled integration as fallback
+                let disabled_config = WebhookConfig {
+                    enabled: false,
+                    ..Default::default()
+                };
+
+                Arc::new(WebhookIntegration::new(disabled_config).await?)
+            }
+        };
 
         // Initialize the state
         let state = ServerState {
@@ -161,19 +223,19 @@ impl SockudoServer {
             connection_manager: connection_manager.clone(),
             auth_validator,
             cache_manager: Arc::new(Mutex::new(cache_manager)),
-            webhooks_integration: webhook_integration,
+            webhooks_integration: webhook_integration.clone(),
             metrics: Some(metrics_driver.clone()),
             running: Arc::new(AtomicBool::new(true)),
         };
 
-        // Create connection handler
+        // Create connection handler with webhook integration
         let handler = Arc::new(ConnectionHandler::new(
             state.app_manager.clone(),
             state.channel_manager.clone(),
             state.connection_manager.clone(),
             state.cache_manager.clone(),
             state.metrics.clone(),
-            Some(state.webhooks_integration.clone())
+            Some(webhook_integration)
         ));
 
         Ok(Self {
@@ -198,6 +260,18 @@ impl SockudoServer {
             secret: "demo-secret".to_string(),
             enable_client_messages: true,
             enabled: true,
+            max_connections: 1000,
+            max_client_events_per_second: 100,
+            webhooks: Some(vec![
+                Webhook {
+                    url: Some("http://localhost:3000/webhook".parse().unwrap()),
+                    lambda_function: None,
+                    lambda: None,
+                    event_types: vec!["member_added".to_string(), "member_removed".to_string()],
+                    filter: None,
+                    headers: None,
+                }
+            ]),
             ..Default::default()
         };
 
@@ -257,12 +331,16 @@ impl SockudoServer {
         // Configure metrics router
         let metrics_router = self.configure_metrics_routes();
 
-        // Create TCP listeners
-        let http_listener = TcpListener::bind(self.config.http_addr).await?;
-        let metrics_listener = TcpListener::bind(self.config.metrics_addr).await?;
+        // Get addresses
+        let http_addr = self.get_http_addr();
+        let metrics_addr = self.get_metrics_addr();
 
-        info!("HTTP server listening on {}", self.config.http_addr);
-        info!("Metrics server listening on {}", self.config.metrics_addr);
+        // Create TCP listeners
+        let http_listener = TcpListener::bind(http_addr).await?;
+        let metrics_listener = TcpListener::bind(metrics_addr).await?;
+
+        info!("HTTP server listening on {}", http_addr);
+        info!("Metrics server listening on {}", metrics_addr);
 
         // Spawn HTTP server
         let http_server = axum::serve(http_listener, http_router);
@@ -330,17 +408,12 @@ impl SockudoServer {
         self.state.running.store(false, Ordering::SeqCst);
 
         // Wait for ongoing operations to complete
-        tokio::time::sleep(Duration::from_secs(1)).await;
-
-        // Perform cleanup of connections/resources
-        {
-            let mut connection_manager = self.state.connection_manager.lock().await;
-        }
+        tokio::time::sleep(Duration::from_secs(self.config.shutdown_grace_period)).await;
 
         // Close cache connections
         {
             let cache_manager = self.state.cache_manager.lock().await;
-            // Add cache manager disconnect code here if needed
+            let _ = cache_manager.disconnect().await;
         }
 
         info!("Server stopped");
@@ -349,305 +422,12 @@ impl SockudoServer {
     }
 
     pub async fn load_options_from_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let mut file = File::open(path)?;
+        let mut file = tokio::fs::File::open(path).await?;
         let mut contents = String::new();
-        file.read_to_string(&mut contents)?;
+        file.read_to_string(&mut contents).await?;
 
-        let options: HashMap<String, Value> = from_str(&contents)?;
-        self.set_options(options).await
-    }
-
-    /// Set options using dot notation
-    pub async fn set_options(&mut self, options: HashMap<String, Value>) -> Result<()> {
-        for (key, value) in options {
-            // Special handling for app IDs to ensure they're strings
-            if key.starts_with("app_manager.array.apps.") && key.contains(".id") {
-                if let Value::Number(num) = &value {
-                    if num.is_i64() || num.is_u64() {
-                        let str_value = value.to_string();
-                        self.set_option(&key, Value::String(str_value)).await?;
-                        continue;
-                    }
-                }
-            }
-
-            self.set_option(&key, value).await?;
-        }
-
-        Ok(())
-    }
-
-    /// Set a single option using dot notation
-    async fn set_option(&mut self, path: &str, value: Value) -> Result<()> {
-        let parts: Vec<&str> = path.split('.').collect();
-
-        // Handle top-level options
-        match parts[0] {
-            "debug" => {
-                if let Value::Bool(val) = value {
-                    self.config.debug = val;
-                }
-            }
-            "host" => {
-                if let Value::String(val) = value.clone() {
-                    let port = self.config.http_addr.port();
-                    match format!("{}:{}", val, port).parse() {
-                        Ok(addr) => self.config.http_addr = addr,
-                        Err(e) => return Err(error::Error::Config(format!("Invalid host: {}", e))),
-                    }
-                }
-            }
-            "port" => {
-                if let Value::Number(val) = value.clone() {
-                    if let Some(port) = val.as_u64() {
-                        let host = self.config.http_addr.ip();
-                        self.config.http_addr = std::net::SocketAddr::new(host, port as u16);
-                    }
-                }
-            }
-            "app_manager" => {
-                self.handle_app_manager_options(&parts[1..], value).await?;
-            }
-            "adapter" => {
-                self.handle_adapter_options(&parts[1..], value)?;
-            }
-            "cache" => {
-                self.handle_cache_options(&parts[1..], value)?;
-            }
-            // Add more top-level options as needed
-            _ => {
-                // Unknown option, log a warning
-                warn!("Unknown option: {}", path);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle app manager specific options
-    async fn handle_app_manager_options(&mut self, parts: &[&str], value: Value) -> Result<()> {
-        if parts.is_empty() {
-            return Ok(());
-        }
-
-        match parts[0] {
-            "array" => {
-                if parts.len() > 1 && parts[1] == "apps" {
-                    // Handle apps configuration
-                    self.handle_apps_configuration(&parts[2..], value).await?;
-                }
-            }
-            "driver" => {
-                // Handle driver type change (e.g., memory, mysql, dynamodb)
-                if let Value::String(driver) = value {
-                    // Implementation would depend on how you want to handle driver changes
-                    info!("Changing app manager driver to: {}", driver);
-                    // Actual implementation would reinitialize the app manager
-                }
-            }
-            // Add more app manager options
-            _ => warn!("Unknown app_manager option: {}", parts[0]),
-        }
-
-        Ok(())
-    }
-
-    /// Handle apps configuration
-    async fn handle_apps_configuration(&mut self, parts: &[&str], value: Value) -> Result<()> {
-        println!("{:?}, {:?}", parts, value);
-        if parts.is_empty() {
-            // Handle setting entire apps array
-            if let Value::Array(apps_array) = value {
-                // Convert JSON array to Vec<App>
-                let mut apps = Vec::new();
-
-                for app_value in apps_array {
-                    match serde_json::from_value::<App>(app_value.clone())  {
-                        Ok(app) => {
-                            
-                        }
-                        Err(e) => {
-                            println!("Invalid app configuration: {}", e);
-                        }
-                    }
-                    if let Ok(app) = serde_json::from_value::<App>(app_value) {
-                        apps.push(app);
-                    } else {
-                        warn!("Invalid app configuration");
-                    }
-                }
-
-                // Register all apps
-                self.register_apps(apps).await?;
-            }
-
-            return Ok(());
-        }
-
-        // Handle individual app settings
-        // parts[0] should be the index of the app
-        if let Some(index_str) = parts.first() {
-            if let Ok(index) = index_str.parse::<usize>() {
-                // Handle operations on a specific app
-                if parts.len() > 1 {
-                    // Get the app from the manager, modify it, and update it
-                    let apps = self.state.app_manager.get_apps().await?;
-
-                    if index < apps.len() {
-                        let mut app = apps[index].clone();
-
-                        // Modify the specific field
-                        match parts[1] {
-                            "id" => {
-                                if let Value::String(id) = value.clone() {
-                                    app.id = id;
-                                } else if let Value::Number(num) = value.clone() {
-                                    app.id = num.to_string();
-                                }
-                            }
-                            "key" => {
-                                if let Value::String(key) = value.clone() {
-                                    app.key = key;
-                                }
-                            }
-                            "secret" => {
-                                if let Value::String(secret) = value.clone() {
-                                    app.secret = secret;
-                                }
-                            }
-                            "enable_client_messages" => {
-                                if let Value::Bool(enable) = value {
-                                    app.enable_client_messages = enable;
-                                }
-                            }
-                            "enabled" => {
-                                if let Value::Bool(enabled) = value {
-                                    app.enabled = enabled;
-                                }
-                            }
-                            // Add more fields as needed
-                            _ => warn!("Unknown app field: {}", parts[1]),
-                        }
-
-                        // Update the app
-                        self.state.app_manager.update_app(app).await?;
-                    } else {
-                        warn!("App index out of bounds: {}", index);
-                    }
-                }
-            } else {
-                warn!("Invalid app index: {}", index_str);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Handle adapter specific options
-    fn handle_adapter_options(&mut self, parts: &[&str], value: Value) -> Result<()> {
-        if parts.is_empty() {
-            return Ok(());
-        }
-
-        match parts[0] {
-            "driver" => {
-                // Handle adapter driver change
-                if let Value::String(driver) = value {
-                    info!("Adapter driver change requested to: {}", driver);
-                    // Implementation would depend on how you want to handle adapter changes
-                }
-            }
-            "redis" => {
-                // Handle Redis adapter options
-                if parts.len() > 1 {
-                    self.handle_redis_adapter_options(&parts[1..], value)?;
-                }
-            }
-            // Add more adapter types
-            _ => warn!("Unknown adapter option: {}", parts[0]),
-        }
-
-        Ok(())
-    }
-
-    /// Handle Redis adapter options
-    fn handle_redis_adapter_options(&mut self, parts: &[&str], value: Value) -> Result<()> {
-        if parts.is_empty() {
-            return Ok(());
-        }
-
-        match parts[0] {
-            "prefix" => {
-                if let Value::String(prefix) = value {
-                    // Update Redis adapter prefix
-                    // This would require modifying the adapter configuration
-                    info!("Updating Redis adapter prefix to: {}", prefix);
-                }
-            }
-            "requests_timeout" => {
-                if let Value::Number(timeout) = value {
-                    if let Some(timeout_ms) = timeout.as_u64() {
-                        // Update Redis adapter timeout
-                        info!("Updating Redis adapter timeout to: {}ms", timeout_ms);
-                    }
-                }
-            }
-            // Add more Redis options
-            _ => warn!("Unknown Redis adapter option: {}", parts[0]),
-        }
-
-        Ok(())
-    }
-
-    /// Handle cache specific options
-    fn handle_cache_options(&mut self, parts: &[&str], value: Value) -> Result<()> {
-        if parts.is_empty() {
-            return Ok(());
-        }
-
-        match parts[0] {
-            "driver" => {
-                // Handle cache driver change
-                if let Value::String(driver) = value {
-                    info!("Cache driver change requested to: {}", driver);
-                    // Implementation would depend on how you want to handle cache driver changes
-                }
-            }
-            "redis" => {
-                // Handle Redis cache options
-                if parts.len() > 1 {
-                    self.handle_redis_cache_options(&parts[1..], value)?;
-                }
-            }
-            // Add more cache options
-            _ => warn!("Unknown cache option: {}", parts[0]),
-        }
-
-        Ok(())
-    }
-
-    /// Handle Redis cache options
-    fn handle_redis_cache_options(&mut self, parts: &[&str], value: Value) -> Result<()> {
-        if parts.is_empty() {
-            return Ok(());
-        }
-
-        match parts[0] {
-            "url" => {
-                if let Value::String(url) = value {
-                    // Update Redis cache URL
-                    info!("Updating Redis cache URL to: {}", url);
-                }
-            }
-            "prefix" => {
-                if let Value::String(prefix) = value {
-                    // Update Redis cache prefix
-                    info!("Updating Redis cache prefix to: {}", prefix);
-                }
-            }
-            // Add more Redis cache options
-            _ => warn!("Unknown Redis cache option: {}", parts[0]),
-        }
+        let options: ServerOptions = from_str(&contents)?;
+        self.config = options;
 
         Ok(())
     }
@@ -658,7 +438,7 @@ impl SockudoServer {
             // First check if the app already exists
             let existing_app = self.state.app_manager.get_app(&app.id).await?;
 
-            if let Some(_) = existing_app {
+            if existing_app.is_some() {
                 // App exists, update it
                 self.state.app_manager.update_app(app).await?;
             } else {
@@ -680,38 +460,54 @@ async fn main() -> Result<()> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+    Log::info("server 1");
 
-    // Get configuration from environment
-    let config = ServerConfig {
-        http_addr: std::env::var("HTTP_BIND_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:6001".to_string())
-            .parse()
-            .expect("Invalid HTTP bind address"),
-        metrics_addr: std::env::var("METRICS_BIND_ADDR")
-            .unwrap_or_else(|_| "127.0.0.1:9601".to_string())
-            .parse()
-            .expect("Invalid metrics bind address"),
+    // Create default ServerOptions
+    let mut config = ServerOptions {
         debug: std::env::var("DEBUG")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false),
+        host: std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
+        port: std::env::var("PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6001),
+        ..Default::default()
     };
+
+    Log::info("server 1");
+
+    // Override from environment variables
+    if let Ok(redis_url) = std::env::var("REDIS_URL") {
+        // Update Redis config
+        if !config.adapter.redis.redis_pub_options.contains_key("url") {
+            config.adapter.redis.redis_pub_options.insert("url".to_string(), json!(redis_url));
+        }
+        if !config.adapter.redis.redis_sub_options.contains_key("url") {
+            config.adapter.redis.redis_sub_options.insert("url".to_string(), json!(redis_url));
+        }
+        if !config.cache.redis.redis_options.contains_key("url") {
+            config.cache.redis.redis_options.insert("url".to_string(), json!(redis_url));
+        }
+    }
+    Log::info("server 1");
 
     // Create and start the server
     let mut server = SockudoServer::new(config).await?;
 
-    server.load_options_from_file("src/config.json").await?;
+    Log::info("server 1");
 
-    // // Or set options programmatically
-    // let mut options = HashMap::new();
-    // options.insert("app_manager.array.apps.0.id".to_string(), json!("demo-app"));
-    // options.insert("app_manager.array.apps.0.key".to_string(), json!("demo-key"));
-    // options.insert("app_manager.array.apps.0.secret".to_string(), json!("demo-secret"));
-    // options.insert("app_manager.array.apps.0.enable_client_messages".to_string(), json!(true));
-    // options.insert("port".to_string(), json!(6001));
-    // options.insert("debug".to_string(), json!(true));
-
-    // server.set_options(options).await?;
-
+    // Load config from file if available
+    let config_path = std::env::var("CONFIG_FILE").unwrap_or_else(|_| "src/config.json".to_string());
+    if Path::new(&config_path).exists() {
+        info!("Loading configuration from {}", config_path);
+        if let Err(e) = server.load_options_from_file(&config_path).await {
+            warn!("Failed to load configuration file: {}", e);
+        }
+    } else {
+        info!("No configuration file found at {}, using defaults", config_path);
+    }
+    Log::info("server 1");
 
     // Start the server and await completion
     server.start().await?;

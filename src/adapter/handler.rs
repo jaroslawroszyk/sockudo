@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tracing_subscriber::fmt::format;
 use crate::webhook::integration::WebhookIntegration;
 
 pub struct ConnectionHandler {
@@ -440,8 +441,15 @@ impl ConnectionHandler {
                     let members = connection_manager
                         .get_channel_members(app_id, channel)
                         .await?;
-                    self.webhook_integration.clone().unwrap().send_member_added(&app.clone().unwrap(), channel, user_id).await?;
-
+                    match self.webhook_integration.clone().unwrap().send_member_added(&app.clone().unwrap(), channel, user_id).await {
+                        Ok(_) => {
+                            Log::info("Presence added successfully!");
+                        },
+                        Err(e) => {
+                            Log::error(format!("Error sending presence to user: {:?}", e));
+                        }
+                    }
+                    Log::webhook_sender(format!("webhook: {:?}", members));
                     let member_added = PusherMessage::member_added(
                         channel.to_string(),
                         user_id.clone(),

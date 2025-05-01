@@ -23,8 +23,8 @@ impl Default for WebhookConfig {
         Self {
             enabled: true,
             batching: BatchingConfig::default(),
-            queue_driver: "memory".to_string(),
-            redis_url: None,
+            queue_driver: "redis".to_string(),
+            redis_url: Some("redis://localhost:6379".to_string()),
             redis_prefix: Some("sockudo".to_string()),
             redis_concurrency: Some(5),
             process_id: uuid::Uuid::new_v4().to_string(),
@@ -82,6 +82,9 @@ impl WebhookIntegration {
             batching_enabled: config.batching.enabled,
             batching_duration: config.batching.duration,
             can_process_queues: true,
+            http_timeout: 0,
+            max_retries: 0,
+            retry_delay: 0,
         };
 
         let queue_manager = Arc::new(QueueManager::new(queue_manager));

@@ -49,9 +49,10 @@ lazy_static = "1.5.0"
 prometheus = "0.14.0"
 once_cell = "1.20.2"
 moka = { version = "0.12.10", features = ["future"] }
-reqwest = "0.12.15"
+reqwest = { version = "0.12.15", features = ["json"] }
 aws-sdk-sqs = "1.65.0"
 async-nats = "0.40.0"
+aws-sdk-lambda = "1.76.0"
 
 
 [dependencies.uuid]

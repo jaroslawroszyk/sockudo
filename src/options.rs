@@ -322,7 +322,7 @@ impl Default for ServerOptions {
                 driver: "redis".to_string(),
                 redis: RedisAdapterConfig {
                     requests_timeout: 5000,
-                    prefix: "pusher".to_string(),
+                    prefix: "sockudo".to_string(),
                     redis_pub_options: HashMap::new(),
                     redis_sub_options: HashMap::new(),
                     cluster_mode: false,
@@ -332,7 +332,7 @@ impl Default for ServerOptions {
                 },
                 nats: NatsConfig {
                     requests_timeout: 5000,
-                    prefix: "pusher".to_string(),
+                    prefix: "sockudo".to_string(),
                     servers: vec!["nats://localhost:4222".to_string()],
                     user: None,
                     pass: None,
@@ -341,15 +341,169 @@ impl Default for ServerOptions {
                     nodes_number: None,
                 },
             },
-            rate_limiter: RateLimiterConfig::default(),
-            // ... other default values
+            app_manager: AppManagerConfig {
+                driver: "memory".to_string(),
+                array: ArrayConfig {
+                    apps: vec![]
+                },
+                cache: CacheSettings {
+                    enabled: true,
+                    ttl: 300
+                },
+            },
+            cache: CacheConfig {
+                driver: "redis".to_string(),
+                redis: RedisConfig {
+                    redis_options: HashMap::new(),
+                    cluster_mode: false
+                }
+            },
+            channel_limits: ChannelLimits {
+                max_name_length: 200,
+                cache_ttl: 3600
+            },
+            cluster: ClusterConfig {
+                hostname: "localhost".to_string(),
+                hello_interval: 5000,
+                check_interval: 10000,
+                node_timeout: 30000,
+                master_timeout: 60000,
+                port: 6002, // Different from main port
+                prefix: "sockudo".to_string(),
+                ignore_process: false,
+                broadcast: "cluster:broadcast".to_string(),
+                unicast: Some("cluster:unicast".to_string()),
+                multicast: Some("cluster:multicast".to_string()),
+            },
+            cors: CorsConfig {
+                credentials: true,
+                origin: vec!["*".to_string()],
+                methods: vec!["GET".to_string(), "POST".to_string(), "OPTIONS".to_string()],
+                allowed_headers: vec![
+                    "Authorization".to_string(),
+                    "Content-Type".to_string(),
+                    "X-Requested-With".to_string(),
+                    "Accept".to_string()
+                ],
+            },
+            database: DatabaseConfig {
+                mysql: DatabaseConnection {
+                    host: "localhost".to_string(),
+                    port: 3306,
+                    user: "root".to_string(),
+                    password: "".to_string(),
+                    database: "sockudo".to_string(),
+                },
+                postgres: DatabaseConnection {
+                    host: "localhost".to_string(),
+                    port: 5432,
+                    user: "postgres".to_string(),
+                    password: "".to_string(),
+                    database: "sockudo".to_string(),
+                },
+                redis: RedisConnection {
+                    host: "localhost".to_string(),
+                    port: 6379,
+                    db: 0,
+                    username: None,
+                    password: None,
+                    key_prefix: "sockudo:".to_string(),
+                    sentinels: vec![],
+                    sentinel_password: None,
+                    name: "master".to_string(),
+                    cluster_nodes: vec![],
+                },
+            },
+            database_pooling: DatabasePooling {
+                enabled: true,
+                min: 2,
+                max: 10,
+            },
             debug: false,
-            port: 6001,
+            event_limits: EventLimits {
+                max_channels_at_once: "100".to_string(),
+                max_name_length: "200".to_string(),
+                max_payload_in_kb: "100".to_string(),
+                max_batch_size: "10".to_string(),
+            },
             host: "0.0.0.0".to_string(),
+            http_api: HttpApiConfig {
+                request_limit_in_mb: "10".to_string(),
+                accept_traffic: AcceptTraffic {
+                    memory_threshold: 0.90
+                }
+            },
+            instance: InstanceConfig {
+                process_id: uuid::Uuid::new_v4().to_string()
+            },
+            metrics: MetricsConfig {
+                enabled: true,
+                driver: "prometheus".to_string(),
+                host: "0.0.0.0".to_string(),
+                prometheus: PrometheusConfig {
+                    prefix: "sockudo_".to_string()
+                },
+                port: 9601,
+            },
+            mode: "production".to_string(),
             path_prefix: "/".to_string(),
+            port: 6001,
+            presence: PresenceConfig {
+                max_members_per_channel: "100".to_string(),
+                max_member_size_in_kb: "2".to_string()
+            },
+            queue: QueueConfig {
+                driver: "redis".to_string(),
+                redis: RedisQueueConfig {
+                    concurrency: 5,
+                    redis_options: HashMap::new(),
+                    cluster_mode: false,
+                },
+                sqs: SqsQueueConfig {
+                    region: "us-east-1".to_string(),
+                    queue_url_prefix: None,
+                    visibility_timeout: 30,
+                    endpoint_url: None,
+                    max_messages: 10,
+                    wait_time_seconds: 5,
+                    concurrency: 5,
+                    fifo: false,
+                    message_group_id: Some("default".to_string()),
+                },
+            },
+            rate_limiter: RateLimiterConfig {
+                driver: "memory".to_string(),
+                default_limit_per_second: 60,
+                default_window_seconds: 60,
+                api_rate_limit: RateLimit {
+                    max_requests: 60,
+                    window_seconds: 60,
+                    identifier: Some("api".to_string()),
+                },
+                websocket_rate_limit: RateLimit {
+                    max_requests: 10,
+                    window_seconds: 60,
+                    identifier: Some("websocket".to_string()),
+                },
+                redis: RedisConfig {
+                    redis_options: HashMap::new(),
+                    cluster_mode: false,
+                },
+            },
             shutdown_grace_period: 10,
-            // Initialize other fields with sensible defaults
-            ..Default::default() // This requires implementing Default for all sub-structs
+            ssl: SslConfig {
+                cert_path: "".to_string(),
+                key_path: "".to_string(),
+                passphrase: "".to_string(),
+                ca_path: "".to_string(),
+            },
+            user_authentication_timeout: 3600,
+            webhooks: WebhooksConfig {
+                batching: BatchingConfig {
+                    enabled: true,
+                    duration: 50
+                }
+            },
         }
     }
 }

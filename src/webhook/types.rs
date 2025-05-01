@@ -2,6 +2,7 @@ use crate::app::config::App;
 use once_cell::sync::Lazy; // <--- IMPORT Lazy
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use crate::log::Log;
 
 // --- WebhookEvent enum remains the same ---
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -169,6 +170,7 @@ impl AppWebhook for App {
     }
 
     fn has_member_added_webhooks(&self) -> bool {
+        Log::info("member_added");
         self.webhooks.as_ref().map_or(false, |webhooks| {
             webhooks.iter().any(|webhook| {
                 webhook
