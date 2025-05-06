@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use crate::log::Log;
 use crate::options::SqsQueueConfig;  // Use the struct from options.rs
-use crate::queue::{JobProcessorFn, QueueInterface};
+use crate::queue::{ArcJobProcessorFn, JobProcessorFn, QueueInterface};
 use async_trait::async_trait;
 use aws_sdk_sqs as sqs;
 use aws_config::SdkConfig;
@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::time::interval;
+use crate::webhook::sender::JobProcessorFnAsync;
 
 /// SQS-based implementation of the QueueInterface
 pub struct SqsQueueManager {
@@ -174,7 +175,7 @@ impl SqsQueueManager {
         &self,
         queue_name: &str,
         queue_url: String,
-        processor: Arc<dyn Fn(crate::webhook::types::JobData) -> Result<()> + Send + Sync>,
+        processor: ArcJobProcessorFn,
         worker_id: usize
     ) -> tokio::task::JoinHandle<()> {
         // Clone values needed for the worker
@@ -227,7 +228,7 @@ impl SqsQueueManager {
                                     match serde_json::from_str::<crate::webhook::types::JobData>(body) {
                                         Ok(job_data) => {
                                             // Call the processor
-                                            match processor(job_data) {
+                                            match processor(job_data).await {
                                                 Ok(_) => {
                                                     // Processing succeeded, delete the message
                                                     if let Some(receipt_handle) = message.receipt_handle() {
@@ -344,12 +345,12 @@ impl QueueInterface for SqsQueueManager {
     }
 
     /// Process jobs from a queue
-    async fn process_queue(&self, queue_name: &str, callback: JobProcessorFn) -> Result<()> {
+    async fn process_queue(&self, queue_name: &str, callback: JobProcessorFnAsync) -> Result<()> {
         // Get the queue URL
         let queue_url = self.get_queue_url(queue_name).await?;
 
         // Wrap the callback in an Arc for thread-safe sharing
-        let processor: Arc<dyn Fn(crate::webhook::types::JobData) -> Result<()> + Send + Sync> =
+        let processor: ArcJobProcessorFn =
             Arc::from(callback);
 
         // Start workers

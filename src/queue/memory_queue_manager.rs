@@ -6,6 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use crate::log::Log;
 use crate::queue::{ArcJobProcessorFn, JobProcessorFn, QueueInterface};
+use crate::webhook::sender::JobProcessorFnAsync;
 use crate::webhook::types::JobData;
 
 /// Memory-based queue manager for simple deployments
@@ -63,17 +64,7 @@ impl MemoryQueueManager {
                                 for job in jobs_to_process {
                                     // Clone the Arc'd processor for the call
                                     let processor_clone = processor.clone();
-                                    match processor_clone(job) {
-                                        // Call the Arc'd function
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            Log::error(format!(
-                                                "Error processing job from memory queue {}: {}",
-                                                queue_name, e
-                                            ));
-                                            // Potential: Add logic here to requeue the job if needed
-                                        }
-                                    }
+                                    processor_clone(job).await.unwrap();
                                 }
                             }
                         }
@@ -95,7 +86,7 @@ impl QueueInterface for MemoryQueueManager {
         Ok(())
     }
 
-    async fn process_queue(&self, queue_name: &str, callback: JobProcessorFn) -> crate::error::Result<()> {
+    async fn process_queue(&self, queue_name: &str, callback: JobProcessorFnAsync) -> crate::error::Result<()> {
         // Ensure the queue Vec exists (might be redundant if add_to_queue is always called first, but safe)
         self.queues.entry(queue_name.to_string()).or_default();
 

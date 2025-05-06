@@ -441,14 +441,15 @@ impl ConnectionHandler {
                     let members = connection_manager
                         .get_channel_members(app_id, channel)
                         .await?;
-                    match self.webhook_integration.clone().unwrap().send_member_added(&app.clone().unwrap(), channel, user_id).await {
-                        Ok(_) => {
-                            Log::info("Presence added successfully!");
-                        },
-                        Err(e) => {
-                            Log::error(format!("Error sending presence to user: {:?}", e));
+                    let webhook_integration = self.webhook_integration.clone();
+                    let app_clone = app.clone().unwrap();
+                    let channel_str = channel.to_string();
+                    let user_id_str = user_id.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) = webhook_integration.unwrap().send_member_added(&app_clone, &channel_str, &user_id_str).await {
+                            Log::error(format!("Error sending presence webhook: {:?}", e));
                         }
-                    }
+                    });
                     Log::webhook_sender(format!("webhook: {:?}", members));
                     let member_added = PusherMessage::member_added(
                         channel.to_string(),

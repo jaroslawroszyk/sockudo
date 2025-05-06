@@ -8,6 +8,7 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use crate::log::Log;
 use crate::queue::{ArcJobProcessorFn, JobProcessorFn, QueueInterface};
+use crate::webhook::sender::JobProcessorFnAsync;
 use crate::webhook::types::JobData;
 
 pub struct RedisQueueManager {
@@ -79,7 +80,7 @@ impl QueueInterface for RedisQueueManager {
     }
 
     /// Registers a callback for a queue and starts worker tasks to process jobs.
-    async fn process_queue(&self, queue_name: &str, callback: JobProcessorFn) -> crate::error::Result<()>
+    async fn process_queue(&self, queue_name: &str, callback: JobProcessorFnAsync) -> crate::error::Result<()>
     where
         JobData: DeserializeOwned + Send + 'static, // Ensure JobData can be deserialized and sent across threads
     {
@@ -114,7 +115,7 @@ impl QueueInterface for RedisQueueManager {
                         // Type hint for clarity
                         let mut conn = worker_redis_conn.lock().await;
                         // Use BLPOP with a timeout (e.g., 1 second)
-                        conn.blpop(&worker_queue_key, 1.0).await
+                        conn.blpop(&worker_queue_key, 0.01).await
                     };
 
                     match blpop_result {
@@ -123,12 +124,13 @@ impl QueueInterface for RedisQueueManager {
                             match serde_json::from_str::<JobData>(&job_data_str) {
                                 Ok(job_data) => {
                                     // Execute the job processing callback
-                                    if let Err(e) = worker_processor(job_data) {
-                                        // Call the Arc'd function
-                                        Log::error(format!("[Worker {}] Error processing job from Redis queue {}: {}", i, worker_queue_name, e));
-                                        // Potential: Add logic here for error handling (e.g., move to dead-letter queue)
-                                    } else {
-                                        // Log::info(format!("[Worker {}] Successfully processed job from Redis queue {}", i, worker_queue_name)); // Optional success log
+                                    match worker_processor(job_data).await {
+                                        Ok(_) => {
+                                            Log::info(format!("Worker finished"));
+                                        }
+                                        Err(e) => {
+                                            Log::error(format!("Worker error: {}", e));
+                                        }
                                     }
                                 }
                                 Err(e) => {

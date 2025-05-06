@@ -10,6 +10,7 @@ use crate::error::Result;
 use crate::queue::{JobProcessorFn, QueueInterface};
 use crate::queue::memory_queue_manager::MemoryQueueManager;
 use crate::queue::redis_queue_manager::RedisQueueManager;
+use crate::webhook::sender::JobProcessorFnAsync;
 
 /// General Queue Manager interface wrapper
 pub struct QueueManagerFactory;
@@ -64,7 +65,7 @@ impl QueueManager {
     }
 
     /// Registers a processor for the specified queue and starts processing (if applicable for the driver).
-    pub async fn process_queue(&self, queue_name: &str, callback: JobProcessorFn) -> Result<()> {
+    pub async fn process_queue(&self, queue_name: &str, callback: JobProcessorFnAsync) -> Result<()> {
         self.driver.process_queue(queue_name, callback).await
     }
 

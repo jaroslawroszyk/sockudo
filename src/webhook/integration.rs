@@ -4,6 +4,7 @@ use crate::log::Log;
 use crate::webhook::sender::{WebhookSender, WebhookSenderConfig};
 use std::sync::Arc;
 use crate::queue::manager::{QueueManager, QueueManagerFactory};
+use crate::webhook::types::AppWebhook;
 
 /// Webhook server configuration
 #[derive(Debug, Clone)]
@@ -22,7 +23,10 @@ impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            batching: BatchingConfig::default(),
+            batching: BatchingConfig {
+                enabled: false,
+                duration: 10,
+            },
             queue_driver: "redis".to_string(),
             redis_url: Some("redis://localhost:6379".to_string()),
             redis_prefix: Some("sockudo".to_string()),
@@ -58,6 +62,11 @@ pub struct WebhookIntegration {
 impl WebhookIntegration {
     /// Create a new webhook integration
     pub async fn new(config: WebhookConfig) -> Result<Self> {
+        Log::info("====== WEBHOOK INTEGRATION SETUP ======");
+        Log::info(format!("Webhook enabled: {}", config.enabled));
+        Log::info(format!("Batching enabled: {}", config.batching.enabled));
+        Log::info(format!("Queue driver: {}", config.queue_driver));
+        Log::info(format!("Redis URL: {:?}", config.redis_url));
         if !config.enabled {
             Log::info("Webhooks are disabled");
             return Ok(Self {
@@ -82,9 +91,9 @@ impl WebhookIntegration {
             batching_enabled: config.batching.enabled,
             batching_duration: config.batching.duration,
             can_process_queues: true,
-            http_timeout: 0,
-            max_retries: 0,
-            retry_delay: 0,
+            http_timeout: 10,
+            max_retries: 10,
+            retry_delay: 10,
         };
 
         let queue_manager = Arc::new(QueueManager::new(queue_manager));
@@ -142,9 +151,27 @@ impl WebhookIntegration {
 
     /// Send a member added webhook
     pub async fn send_member_added(&self, app: &App, channel: &str, user_id: &str) -> Result<()> {
+        Log::info("====== MEMBER ADDED WEBHOOK ======");
+        Log::info(format!("App ID: {}", app.id));
+        Log::info(format!("Channel: {}", channel));
+        Log::info(format!("User ID: {}", user_id));
+
+        // Check if the app has webhook config
+        Log::info(format!("App has webhooks: {}", app.webhooks.is_some()));
+
+        // Check if the app has member_added webhooks specifically
+        if !app.has_member_added_webhooks() {
+            Log::info("App doesn't have member_added webhooks configured");
+            return Ok(());
+        }
+
+        Log::info("App has member_added webhooks, sending event");
+
+        // Rest of the existing code...
         if let Some(sender) = &self.sender {
             sender.send_member_added(app, channel, user_id).await
         } else {
+            Log::info("Webhook sender is not initialized");
             Ok(())
         }
     }
