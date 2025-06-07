@@ -569,7 +569,6 @@ impl Clone for PgSQLAppManager {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use tokio::runtime::Runtime;
 
     // Helper to create a test app
     fn create_test_app(id: &str) -> App {
